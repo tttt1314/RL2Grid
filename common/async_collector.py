@@ -49,6 +49,8 @@ def _worker(remote, parent_remote, env_fn: Callable) -> None:
                 remote.send(("ok", obs))
             elif cmd == "spaces":
                 remote.send(("ok", (env.observation_space, env.action_space)))
+            elif cmd == "get_attr":
+                remote.send(("ok", getattr(env, data)))
             elif cmd == "close":
                 break
     except (KeyboardInterrupt, EOFError):
@@ -80,6 +82,10 @@ class AsyncCollector:
             self.remotes.append(parent)
             self.processes.append(p)
         self.single_observation_space, self.single_action_space = self._call(0, "spaces")
+        # Continuous actions must be clipped to the Box before stepping, otherwise grid2op flags
+        # them as ambiguous and silently applies do-nothing (same fix as the synchronous path).
+        space = self.single_action_space
+        self._clip = (space.low, space.high) if hasattr(space, "low") and hasattr(space, "high") else None
         self.obs = None  # latest observation of every worker, shape (n_envs, obs_dim)
         self.n_transitions_total = 0
 
@@ -99,6 +105,10 @@ class AsyncCollector:
             r.send(("reset", None if seed is None else seed + i))
         self.obs = np.stack([self._recv(i) for i in range(self.num_envs)])
         return self.obs, {}
+
+    def get_attr(self, name: str) -> list:
+        """Same contract as gymnasium's VectorEnv.get_attr; only valid between rollouts."""
+        return [self._call(i, "get_attr", name) for i in range(self.num_envs)]
 
     def close(self) -> None:
         for r in self.remotes:
@@ -139,6 +149,8 @@ class AsyncCollector:
                 action, logprob, _ = agent.get_action(obs_t)
                 value = agent.get_value(obs_t).flatten()
                 act_np = action.cpu().numpy()
+                if self._clip is not None:  # stored action (for the log-prob) stays unclipped, as in sync PPO
+                    act_np = np.clip(act_np, *self._clip)
                 for k, i in enumerate(idx):
                     seg["obs"][i].append(obs_t[k])
                     seg["actions"][i].append(action[k])

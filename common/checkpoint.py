@@ -18,7 +18,7 @@ class CheckpointSaver(ABC):
     def __post_init__(self):
         """Post-initialization to set up the checkpoint directory and load a checkpoint if resuming a run."""
         self.ckpt_dir = 'checkpoint'
-        if not os.path.exists(self.ckpt_dir): os.makedirs(self.ckpt_dir)
+        os.makedirs(self.ckpt_dir, exist_ok=True)  # concurrent runs may race on creation
         self.loaded_run, self.record = {}, {}
         if self.args.resume_run_name:
             checkpoint_name = 'checkpoint/' + self.args.resume_run_name + '.tar'

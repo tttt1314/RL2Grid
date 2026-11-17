@@ -8,6 +8,7 @@ from alg.lagr_ppo.core import LagrPPO
 from alg.ppo.core import PPO
 from alg.sac.core import SAC
 from alg.td3.core import TD3
+from common.async_collector import AsyncCollector
 from common.checkpoint import DQNCheckpoint, LagrPPOCheckpoint, PPOCheckpoint, SACCheckpoint, TD3Checkpoint
 from common.imports import *
 from common.utils import set_random_seed, set_torch, str2bool
@@ -76,7 +77,13 @@ def main(args: Namespace) -> None:
             
             return auxiliary_make_env(args, resume_run=checkpoint.resumed, idx=idx)[0]
             
-        envs = gym.vector.AsyncVectorEnv([lambda i=i: make_vec_subprocess(i) for i in range(args.n_envs)])
+        env_fns = [lambda i=i: make_vec_subprocess(i) for i in range(args.n_envs)]
+        if getattr(args, "async_collect", False):
+            if alg != "PPO":
+                raise NotImplementedError("--async-collect is currently implemented for PPO only")
+            envs = AsyncCollector(env_fns)
+        else:
+            envs = gym.vector.AsyncVectorEnv(env_fns)
 
         # Run the specified algorithm
         ALGORITHMS[alg](envs, run_name, start_time, args, checkpoint)
@@ -88,6 +95,8 @@ if __name__ == "__main__":
     parser.add_argument("--time-limit", type=float, default=2790, help="Time limit")
     parser.add_argument("--checkpoint", type=str2bool, default=False, help="Toggles checkpoint.")
     parser.add_argument("--resume-run-name", type=str, default='', help="Run name to resume")
+    parser.add_argument("--async-collect", type=str2bool, default=False,
+                        help="Barrier-free rollout collection (PPO only); off = original AsyncVectorEnv")
 
     # Reproducibility
     parser.add_argument("--alg", type=str, default='PPO', help="Algorithm to run")

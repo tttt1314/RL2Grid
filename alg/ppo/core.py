@@ -2,6 +2,7 @@ from time import time
 
 from .agent import Agent
 from .config import get_alg_args
+from common.async_collector import compute_segment_gae
 from common.checkpoint import CheckpointSaver
 from common.imports import *
 from common.logger import Logger
@@ -79,55 +80,72 @@ class PPO:
                     actor_optim.param_groups[0]['lr'] = frac * args.actor_lr
                     critic_optim.param_groups[0]['lr'] = frac * args.critic_lr
             
-                for step in range(0, args.n_steps):
-                    global_step += args.n_envs
-                    observations[step] = next_obs
-
+                if getattr(args, "async_collect", False):
+                    # Barrier-free rollout: workers are stepped as soon as they are ready
+                    t_roll = time()
+                    seg = envs.collect(agent, batch_size, device)
+                    prev_step, global_step = global_step, global_step + batch_size
                     with th.no_grad():
-                        action, logprob, _ = agent.get_action(next_obs)
-                        value = agent.get_value(next_obs)
-                        values[step] = value.flatten()
-                    actions[step] = action
-                    logprobs[step] = logprob
-
-                    next_obs, reward, next_terminations, next_truncations, infos = envs.step(action.cpu().numpy())
-
-                    rewards[step] = th.tensor(reward).to(device).view(-1)
-                    dones[step] = th.tensor(np.logical_or(next_terminations, next_truncations)).to(device)
-                    terminations[step] = th.tensor(next_terminations).to(device)
-
-                    real_next_obs = next_obs.copy()
-                    for idx, done in enumerate(dones[step]):
-                        if done: 
-                            real_next_obs[idx] = infos["final_observation"][idx]
-                            
-                    next_obs = th.tensor(next_obs).to(device)
-                    real_next_obs = th.tensor(real_next_obs).to(device)
-
-                    if global_step % args.eval_freq == 0:
+                        batch = compute_segment_gae(seg, args.gamma, args.gae_lambda, device)
+                    b_obs, b_logprobs, b_actions = batch["obs"], batch["logprobs"], batch["actions"]
+                    b_advantages, b_returns, b_values = batch["advantages"], batch["returns"], batch["values"]
+                    # The policy is fixed within a rollout, so one eval per crossed eval_freq boundary
+                    # gives the same information as the synchronous loop's (possibly repeated) evals.
+                    if global_step // args.eval_freq > prev_step // args.eval_freq:
                         evaluator.evaluate(global_step, agent)
-                        if args.verbose: print(f"SPS={int(global_step / (time() - start_time))}")
+                        if args.verbose:
+                            print(f"SPS={int(global_step / (time() - start_time))} "
+                                  f"rollout_s={time() - t_roll:.1f} waits={seg['n_waits']}")
+                else:
+                    for step in range(0, args.n_steps):
+                        global_step += args.n_envs
+                        observations[step] = next_obs
 
-                # Bootstrap value if not done
-                with th.no_grad():
-                    advantages = th.zeros_like(rewards).to(device)
-                    lastgaelam = 0
-                    for t in reversed(range(args.n_steps)):
-                        if t == args.n_steps - 1:
-                            nextvalues = agent.get_value(real_next_obs).reshape(1, -1)
-                        else:
-                            nextvalues = values[t + 1]
-                        delta = rewards[t] + args.gamma * nextvalues * (1 - terminations[t]) - values[t]
-                        advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * (1 - dones[t]) * lastgaelam
-                    returns = advantages + values
+                        with th.no_grad():
+                            action, logprob, _ = agent.get_action(next_obs)
+                            value = agent.get_value(next_obs)
+                            values[step] = value.flatten()
+                        actions[step] = action
+                        logprobs[step] = logprob
+
+                        next_obs, reward, next_terminations, next_truncations, infos = envs.step(action.cpu().numpy())
+
+                        rewards[step] = th.tensor(reward).to(device).view(-1)
+                        dones[step] = th.tensor(np.logical_or(next_terminations, next_truncations)).to(device)
+                        terminations[step] = th.tensor(next_terminations).to(device)
+
+                        real_next_obs = next_obs.copy()
+                        for idx, done in enumerate(dones[step]):
+                            if done: 
+                                real_next_obs[idx] = infos["final_observation"][idx]
+                            
+                        next_obs = th.tensor(next_obs).to(device)
+                        real_next_obs = th.tensor(real_next_obs).to(device)
+
+                        if global_step % args.eval_freq == 0:
+                            evaluator.evaluate(global_step, agent)
+                            if args.verbose: print(f"SPS={int(global_step / (time() - start_time))}")
+
+                    # Bootstrap value if not done
+                    with th.no_grad():
+                        advantages = th.zeros_like(rewards).to(device)
+                        lastgaelam = 0
+                        for t in reversed(range(args.n_steps)):
+                            if t == args.n_steps - 1:
+                                nextvalues = agent.get_value(real_next_obs).reshape(1, -1)
+                            else:
+                                nextvalues = values[t + 1]
+                            delta = rewards[t] + args.gamma * nextvalues * (1 - terminations[t]) - values[t]
+                            advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * (1 - dones[t]) * lastgaelam
+                        returns = advantages + values
    
-                # Flatten the batch
-                b_obs = observations.reshape((-1,) + envs.single_observation_space.shape)
-                b_logprobs = logprobs.reshape(-1)
-                b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-                b_advantages = advantages.reshape(-1)
-                b_returns = returns.reshape(-1)
-                b_values = values.reshape(-1)
+                    # Flatten the batch
+                    b_obs = observations.reshape((-1,) + envs.single_observation_space.shape)
+                    b_logprobs = logprobs.reshape(-1)
+                    b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+                    b_advantages = advantages.reshape(-1)
+                    b_returns = returns.reshape(-1)
+                    b_values = values.reshape(-1)
 
                 # Optimizing the policy and value network
                 b_inds = np.arange(batch_size)

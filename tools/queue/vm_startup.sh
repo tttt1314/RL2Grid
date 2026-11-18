@@ -8,7 +8,8 @@ H=/home/$U
 [ -f "$H/queue/queue_args" ] || exit 0
 sudo -u "$U" bash -c "
   cd $H/RL2Grid-fork || exit 0
-  pgrep -f 'tools/queue/run_queu[e].py' >/dev/null && exit 0
+  # anchored: this bash -c command line itself contains the script path and must not match
+  pgrep -f '^python3 tools/queue/run_queue.py' >/dev/null && exit 0
   echo \"\$(date '+%F %T') BOOT: (re)starting queue\" >> $H/queue/queue.log
   nohup python3 tools/queue/run_queue.py --jobs tools/queue/jobs_bus14.tsv --seeds 0 1 2 --max-slots 4 \
       \$(cat $H/queue/queue_args) >> $H/queue/queue.log 2>&1 < /dev/null &

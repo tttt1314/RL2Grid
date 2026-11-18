@@ -40,6 +40,8 @@ PYTHON = HOME / "miniconda3" / "envs" / "rl2grid" / "bin" / "python"
 LAUNCHER = (
     "import signal,sys,runpy;"
     "signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()));"
+    # a nohup'ed / backgrounded parent leaves SIGINT ignored, and Python then never raises KeyboardInterrupt
+    "signal.signal(signal.SIGINT, signal.default_int_handler);"
     "sys.argv=['main.py']+sys.argv[1:];"
     "runpy.run_path('main.py', run_name='__main__')"
 )
@@ -159,7 +161,9 @@ class Job:
     def interrupt(self) -> None:
         self.interrupted = True   # a shutdown is not a crash: never mark the job FAILED because of it
         if self.proc and self.proc.poll() is None:
-            os.killpg(self.proc.pid, signal.SIGINT)
+            # SIGTERM to the main process only: the launcher turns it into KeyboardInterrupt, RL2Grid's finally:
+            # saves the checkpoint and closes its workers. (SIGINT may be ignored when started via nohup/&.)
+            os.kill(self.proc.pid, signal.SIGTERM)
 
 
 def main() -> None:

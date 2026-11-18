@@ -59,9 +59,10 @@ def load_jobs(path: Path, seeds: list[int]) -> list[dict]:
         name, slots, extra = line.split("\t", 2)
         budget = int(re.search(r"--total-timesteps (\d+)", extra).group(1))
         for s in seeds:
-            jobs.append(dict(id=f"{name}_s{s}", slots=int(slots), budget=budget,
+            jobs.append(dict(id=f"{name}_s{s}", slots=int(slots), budget=budget, seed=s,
                              args=f"--env-id bus14 --difficulty 0 --seed {s} {extra}".split()))
-    return jobs
+    # seed-major: every config's seed 0 first, then seed 1, ... -> a complete first table appears early
+    return sorted(jobs, key=lambda j: seeds.index(j["seed"]))
 
 
 class Job:
@@ -71,6 +72,7 @@ class Job:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.segment_min = segment_min
         self.proc: subprocess.Popen | None = None
+        self.interrupted = False
         self.t0 = 0.0
 
     # ---- persistent state -------------------------------------------------------------
@@ -103,9 +105,36 @@ class Job:
             args += ["--resume-run-name", self.run_name]
         logf = open(self.dir / f"seg_{seg:03d}.log", "w")
         self.t0 = time.time()
+        (self.dir / "seg_t0").write_text(str(self.t0))   # lets a restarted queue claim this segment's checkpoint
         self.proc = subprocess.Popen([str(PYTHON), "-u", "-c", LAUNCHER, *args], cwd=RL2GRID,
                                      stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
         log(f"START {self.id} seg={seg} resume={self.run_name or '-'} pid={self.proc.pid}")
+
+    def ckpt_prefix(self) -> str:
+        # run_name = {alg}_{env}_{T|R}_{seed}_{difficulty}_{H}_{I}_{C}_{time}_{rand}
+        a = self.args
+        alg = a[a.index("--alg") + 1]
+        kind = "T" if "topology" in a else "R"
+        seed = a[a.index("--seed") + 1]
+        heur = "H" if "--use-heuristic" in a else ""
+        idle = "I" if "reconnect" not in a else ""  # --heuristic-type defaults to idle -> "I" even for vanilla runs
+        cons = {"1": "C1", "2": "C2"}.get(a[a.index("--constraints-type") + 1], "") if "--constraints-type" in a else ""
+        return f"{alg}_bus14_{kind}_{seed}_0_{heur}_{idle}_{cons}_"
+
+    def claim(self, claimed: set, since: float) -> None:
+        cands = sorted((p for p in CKPT_DIR.glob(self.ckpt_prefix() + "*.tar")
+                        if p.stem not in claimed and p.stat().st_mtime >= since),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        if cands:
+            (self.dir / "run_name").write_text(cands[0].stem)
+            claimed.add(cands[0].stem)
+            log(f"CLAIM {self.id} -> {cands[0].stem}")
+
+    def recover(self, claimed: set) -> None:
+        """Queue restarted after its first segment was interrupted before the checkpoint was claimed."""
+        t0f = self.dir / "seg_t0"
+        if not self.done and not self.run_name and t0f.exists():
+            self.claim(claimed, float(t0f.read_text()) - 5)
 
     def poll(self, claimed: set[str]) -> bool:
         """Return True when the current segment has finished (state updated)."""
@@ -113,20 +142,7 @@ class Job:
             return False
         elapsed_min = (time.time() - self.t0) / 60
         if not self.run_name:  # first segment: find the checkpoint this process just wrote
-            cands = sorted((p for p in CKPT_DIR.glob("*.tar")
-                            if p.stem not in claimed and p.stat().st_mtime >= self.t0),
-                           key=lambda p: p.stat().st_mtime, reverse=True)
-            # run_name = {alg}_{env}_{T|R}_{seed}_{difficulty}_{H}_{I}_{C}_{time}_{rand}
-            alg = self.args[self.args.index("--alg") + 1]
-            kind = "T" if "topology" in self.args else "R"
-            seed = self.args[self.args.index("--seed") + 1]
-            heur = "--use-heuristic" in self.args
-            idle = "reconnect" not in self.args  # --heuristic-type defaults to idle -> "I" even for vanilla runs
-            prefix = f"{alg}_bus14_{kind}_{seed}_0_{'H' if heur else ''}_{'I' if idle else ''}_"
-            cands = [p for p in cands if p.stem.startswith(prefix)]
-            if cands:
-                (self.dir / "run_name").write_text(cands[0].stem)
-                claimed.add(cands[0].stem)
+            self.claim(claimed, self.t0)
         step = self.last_step()
         finished_early = elapsed_min < 0.9 * self.segment_min and self.proc.returncode == 0
         if step >= self.budget * 0.98 or (finished_early and step > 0):
@@ -134,13 +150,14 @@ class Job:
             log(f"DONE  {self.id} step={step}")
         else:
             log(f"SEG   {self.id} rc={self.proc.returncode} {elapsed_min:.0f}min step={step}/{self.budget}")
-            if self.proc.returncode not in (0, None) and elapsed_min < 5:
+            if self.proc.returncode not in (0, None) and elapsed_min < 5 and not self.interrupted:
                 (self.dir / "FAILED").write_text(f"rc={self.proc.returncode}\n")
                 log(f"FAIL  {self.id} (crashed within 5 min, see {self.dir})")
         self.proc = None
         return True
 
     def interrupt(self) -> None:
+        self.interrupted = True   # a shutdown is not a crash: never mark the job FAILED because of it
         if self.proc and self.proc.poll() is None:
             os.killpg(self.proc.pid, signal.SIGINT)
 
@@ -150,7 +167,7 @@ def main() -> None:
     ap.add_argument("--jobs", default=str(Path(__file__).with_name("jobs_bus14.tsv")))
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     ap.add_argument("--max-slots", type=int, default=4)
-    ap.add_argument("--segment-min", type=int, default=120)
+    ap.add_argument("--segment-min", type=int, default=360)  # most off-policy runs finish in one segment
     ap.add_argument("--only", nargs="*", default=None, help="run only these job-name prefixes")
     a = ap.parse_args()
 
@@ -158,6 +175,8 @@ def main() -> None:
     if a.only:
         jobs = [j for j in jobs if any(j.id.startswith(p) for p in a.only)]
     claimed = {j.run_name for j in jobs if j.run_name}
+    for j in jobs:
+        j.recover(claimed)
     running: list[Job] = []
 
     stopping = False

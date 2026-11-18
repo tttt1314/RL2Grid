@@ -80,6 +80,9 @@ class SAC:
 
         init_step = 1 if not ckpt.resumed else ckpt.loaded_run['last_step']
         global_step = 0 if not ckpt.resumed else ckpt.loaded_run['global_step']
+        # The replay buffer is not checkpointed: after a resume, refill learning_starts fresh transitions
+        # before training again (as on a fresh start) instead of sampling a buffer of a few dozen rows.
+        train_from_step = args.learning_starts if not ckpt.resumed else global_step + args.learning_starts
         start_time = start_time
         obs, _ = envs.reset(seed=args.seed)
        
@@ -115,7 +118,7 @@ class SAC:
                     evaluator.evaluate(global_step, actor)
                     if args.verbose: print(f"SPS={int(global_step / (time() - start_time))}")
 
-                if global_step > args.learning_starts:
+                if global_step > train_from_step:
                     if global_step % args.train_freq == 0:
                         data = replay_buf.sample(args.batch_size)
 

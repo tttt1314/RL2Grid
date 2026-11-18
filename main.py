@@ -66,8 +66,14 @@ def main(args: Namespace) -> None:
 
     with Manager() as manager:
         if args.action_type == "topology":
-            print("Initializing the distributed action 'mapper'... (takes a while with big action spaces)")
-            shared_action_space = manager.list(main_gym_env.action_space.converter.all_actions)
+            if getattr(args, "shared_action_space", False):
+                # Original behaviour: one Manager process serves every worker's action lookup over IPC,
+                # which serialises all n_envs workers on a single process (main bottleneck on bus14).
+                print("Initializing the distributed action 'mapper'... (takes a while with big action spaces)")
+                shared_action_space = manager.list(main_gym_env.action_space.converter.all_actions)
+            else:
+                # Workers are forked, so they inherit this list directly: same actions, no per-step IPC.
+                shared_action_space = list(main_gym_env.action_space.converter.all_actions)
 
         def make_vec_subprocess(idx):
             if args.action_type == "topology":
@@ -97,6 +103,9 @@ if __name__ == "__main__":
     parser.add_argument("--resume-run-name", type=str, default='', help="Run name to resume")
     parser.add_argument("--async-collect", type=str2bool, default=False,
                         help="Barrier-free rollout collection (PPO only); off = original AsyncVectorEnv")
+    parser.add_argument("--shared-action-space", type=str2bool, default=False,
+                        help="Serve topology actions from a multiprocessing.Manager (original, slow); "
+                             "default False gives each forked worker a local copy of the same action list")
 
     # Reproducibility
     parser.add_argument("--alg", type=str, default='PPO', help="Algorithm to run")

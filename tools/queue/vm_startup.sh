@@ -8,6 +8,7 @@ H=/home/$U
 [ -f "$H/queue/queue_args" ] || exit 0
 sudo -u "$U" bash -c "
   cd $H/RL2Grid-fork || exit 0
+  git pull -q --ff-only >> $H/queue/queue.log 2>&1 || true   # pick up fixes pushed while the VM was off
   # anchored: this bash -c command line itself contains the script path and must not match
   pgrep -f '^python3 tools/queue/run_queue.py' >/dev/null && exit 0
   echo \"\$(date '+%F %T') BOOT: (re)starting queue\" >> $H/queue/queue.log

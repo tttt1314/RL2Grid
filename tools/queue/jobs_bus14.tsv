@@ -3,15 +3,17 @@
 # slots: CPU share on a 32-vCPU VM (max-slots 4). Async PPO and vanilla runs keep all 50 workers busy -> 2;
 #        sync heuristic runs (DQN/SAC) are straggler-bound and mostly idle -> 1.
 # budgets: vanilla / redispatch 2M agent steps; heuristic (I/R) 500k agent steps (each spans many grid steps).
-PPO_T_V	2	--action-type topology --alg PPO --async-collect True --total-timesteps 2000000
-PPO_T_I	2	--action-type topology --alg PPO --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000
-PPO_T_R	2	--action-type topology --alg PPO --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000
-PPO_R	2	--action-type redispatch --alg PPO --async-collect True --total-timesteps 2000000
-DQN_T_V	2	--action-type topology --alg DQN --total-timesteps 2000000
-DQN_T_I	1	--action-type topology --alg DQN --use-heuristic True --heuristic-type idle --total-timesteps 500000
-DQN_T_R	1	--action-type topology --alg DQN --use-heuristic True --heuristic-type reconnect --total-timesteps 500000
-TD3_R	2	--action-type redispatch --alg TD3 --total-timesteps 2000000
-SAC_T_V	2	--action-type topology --alg SAC --total-timesteps 2000000
-SAC_T_I	1	--action-type topology --alg SAC --use-heuristic True --heuristic-type idle --total-timesteps 500000
-SAC_T_R	1	--action-type topology --alg SAC --use-heuristic True --heuristic-type reconnect --total-timesteps 500000
-SAC_R	2	--action-type redispatch --alg SAC --total-timesteps 2000000
+# eval: --eval-freq 50000 (2M runs) / 25000 (500k runs); defaults (PPO 10k, DQN 500, SAC/TD3 1k) make the
+#       single-threaded in-process evaluation dominate once episodes get long (up to 8064 steps x 3 episodes).
+PPO_T_V	2	--action-type topology --alg PPO --async-collect True --total-timesteps 2000000 --eval-freq 50000
+PPO_T_I	2	--action-type topology --alg PPO --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000
+PPO_T_R	2	--action-type topology --alg PPO --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000
+PPO_R	2	--action-type redispatch --alg PPO --async-collect True --total-timesteps 2000000 --eval-freq 50000
+DQN_T_V	2	--action-type topology --alg DQN --total-timesteps 2000000 --eval-freq 50000
+DQN_T_I	1	--action-type topology --alg DQN --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000
+DQN_T_R	1	--action-type topology --alg DQN --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000
+TD3_R	2	--action-type redispatch --alg TD3 --total-timesteps 2000000 --eval-freq 50000
+SAC_T_V	2	--action-type topology --alg SAC --total-timesteps 2000000 --eval-freq 50000
+SAC_T_I	1	--action-type topology --alg SAC --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000
+SAC_T_R	1	--action-type topology --alg SAC --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000
+SAC_R	2	--action-type redispatch --alg SAC --total-timesteps 2000000 --eval-freq 50000

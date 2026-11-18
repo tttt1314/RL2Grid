@@ -1,3 +1,9 @@
+import os
+# Must be set before numpy/torch load OpenBLAS. With the default (one thread per core) the idle OpenBLAS
+# threads of the main process busy-wait after every policy forward and starve the env workers.
+# bus14 PPO, 32 vCPU: 32 threads ~330 SPS, 1: 352, 4: 404, 8: 412 (best trade-off with the PPO update).
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "8")
+
 from multiprocessing import Manager
 from time import time
 

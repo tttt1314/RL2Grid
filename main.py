@@ -91,8 +91,8 @@ def main(args: Namespace) -> None:
             
         env_fns = [lambda i=i: make_vec_subprocess(i) for i in range(args.n_envs)]
         if getattr(args, "async_collect", False):
-            if alg != "PPO":
-                raise NotImplementedError("--async-collect is currently implemented for PPO only")
+            if alg not in ("PPO", "DQN", "SAC", "TD3"):
+                raise NotImplementedError("--async-collect is implemented for PPO, DQN, SAC and TD3 (not LagrPPO)")
             envs = AsyncCollector(env_fns)
         else:
             envs = gym.vector.AsyncVectorEnv(env_fns)

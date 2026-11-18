@@ -106,8 +106,18 @@ class AsyncCollector:
         self.obs = np.stack([self._recv(i) for i in range(self.num_envs)])
         return self.obs, {}
 
+    def _drain_pending(self) -> None:
+        """Finish in-flight off-policy steps (kept for the next collect) so the pipes are idle."""
+        for i in list(getattr(self, "_pending", {})):
+            next_obs, reward, terminated, truncated, final_obs = self._recv(i)
+            obs, action = self._pending.pop(i)
+            real_next = final_obs if final_obs is not None else next_obs
+            self._carry.append((obs, real_next, action, reward, terminated))
+            self.obs[i] = next_obs
+
     def get_attr(self, name: str) -> list:
-        """Same contract as gymnasium's VectorEnv.get_attr; only valid between rollouts."""
+        """Same contract as gymnasium's VectorEnv.get_attr (e.g. obs_rms for the evaluator)."""
+        self._drain_pending()  # a pending step reply would otherwise be read as the attribute
         return [self._call(i, "get_attr", name) for i in range(self.num_envs)]
 
     def close(self) -> None:
@@ -181,6 +191,48 @@ class AsyncCollector:
         seg["bootstrap"] = boot
         seg["n_waits"] = idle_waits
         return seg
+
+
+    # ------------------------------------------------------------- off-policy
+    def collect_transitions(self, act_fn: Callable, n: int) -> Dict[str, np.ndarray]:
+        """Return exactly `n` transitions for a replay buffer, without any barrier.
+
+        Off-policy algorithms (DQN / SAC / TD3) do not need the data to come from one policy, so
+        workers are never drained: whatever is still in flight when `n` transitions are ready keeps
+        simulating while the caller trains, and is returned by the next call. Results beyond `n`
+        that arrive together are carried over, so no transition is ever dropped.
+
+        `act_fn(obs_batch) -> actions` is called on the observations of the workers that are ready.
+        """
+        if self.obs is None:
+            self.reset()
+        if not hasattr(self, "_pending"):
+            self._pending: Dict[int, tuple] = {}   # worker -> (obs, executed action)
+            self._carry: List[tuple] = []          # finished transitions not yet returned
+        out = self._carry
+        self._carry = []
+        while len(out) < n:
+            ready = [i for i in range(self.num_envs) if i not in self._pending]
+            if ready:
+                obs_batch = self.obs[ready]
+                actions = np.asarray(act_fn(obs_batch))
+                if self._clip is not None:
+                    actions = np.clip(actions, *self._clip)
+                for k, i in enumerate(ready):
+                    self._pending[i] = (obs_batch[k].copy(), actions[k])
+                    self.remotes[i].send(("step", actions[k]))
+            for conn in wait([self.remotes[i] for i in self._pending]):
+                i = self.remotes.index(conn)
+                next_obs, reward, terminated, truncated, final_obs = self._recv(i)
+                obs, action = self._pending.pop(i)
+                real_next = final_obs if final_obs is not None else next_obs
+                out.append((obs, real_next, action, reward, terminated))
+                self.obs[i] = next_obs
+        out, self._carry = out[:n], out[n:]
+        self.n_transitions_total += n
+        o, no, a, r, t = zip(*out)
+        return {"obs": np.stack(o), "next_obs": np.stack(no), "actions": np.stack(a),
+                "rewards": np.asarray(r, dtype=np.float32), "terminations": np.asarray(t, dtype=np.float32)}
 
 
 def compute_segment_gae(seg: Dict[str, list], gamma: float, gae_lambda: float, device: th.device):

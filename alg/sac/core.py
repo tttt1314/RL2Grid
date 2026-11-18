@@ -87,22 +87,29 @@ class SAC:
             for step in range(init_step, int(args.total_timesteps // args.n_envs)):
                 global_step += args.n_envs
 
-                if global_step < args.learning_starts:
-                    actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
-                else:
+                def act_fn(o: np.ndarray) -> np.ndarray:
+                    if global_step < args.learning_starts:
+                        return np.array([envs.single_action_space.sample() for _ in range(len(o))])
                     with th.no_grad():
-                        actions, _, _ = actor.get_action(th.tensor(obs).to(device))
-                        actions = actions.detach().cpu().numpy()
+                        a, _, _ = actor.get_action(th.tensor(o).to(device))
+                        return a.detach().cpu().numpy()
 
-                next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+                if getattr(args, "async_collect", False):
+                    # Barrier-free: exactly n_envs transitions per iteration, so every %-based schedule below is unchanged
+                    tr = envs.collect_transitions(act_fn, args.n_envs)
+                    replay_buf.add(tr["obs"], tr["next_obs"], tr["actions"], tr["rewards"], tr["terminations"], [{}] * args.n_envs)
+                else:
+                    actions = act_fn(obs)
 
-                real_next_obs = next_obs.copy()
-                for idx, done in enumerate(np.logical_or(terminations, truncations)):
-                    if done: real_next_obs[idx] = infos["final_observation"][idx]
-                
-                replay_buf.add(obs, real_next_obs, actions, rewards, terminations, infos)
+                    next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
-                obs = next_obs
+                    real_next_obs = next_obs.copy()
+                    for idx, done in enumerate(np.logical_or(terminations, truncations)):
+                        if done: real_next_obs[idx] = infos["final_observation"][idx]
+
+                    replay_buf.add(obs, real_next_obs, actions, rewards, terminations, infos)
+
+                    obs = next_obs
 
                 if global_step % args.eval_freq == 0:
                     evaluator.evaluate(global_step, actor)

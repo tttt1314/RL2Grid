@@ -36,6 +36,8 @@ class Evaluator:
         if args.action_type == 'topology': self.reward_tags += ['Topology Reward']      
         if args.n1_reward: self.reward_tags += ['N1 Reward']
         self.use_heuristic = args.use_heuristic
+        # --eval-episodes (default 3 = original): more episodes -> less noisy survival estimates
+        self.eval_episodes = getattr(args, 'eval_episodes', 3)
         self.train_envs = envs if args.norm_obs else None   # source of the observation statistics
         if self.use_heuristic: self.env.set_n_rewards(len(self.reward_tags))
             
@@ -44,7 +46,7 @@ class Evaluator:
         if self.train_envs is not None: self.env.obs_rms = deepcopy(self.train_envs.get_attr('obs_rms')[0])
         return self.env.reset()
 
-    def evaluate(self, glob_step: int, model: object, eval_ep: int = 3) -> None:
+    def evaluate(self, glob_step: int, model: object, eval_ep: int = None) -> None:
         """Evaluate the model over a specified number of episodes.
 
         Args:
@@ -53,6 +55,7 @@ class Evaluator:
             eval_ep: Number of episodes for evaluation.
         """
         
+        eval_ep = eval_ep or self.eval_episodes
         ep_survivals: Deque[float] = deque(maxlen=eval_ep)  # Queue to store survival rates of episodes
         ep_returns: Deque[float] = deque(maxlen=eval_ep)  # Queue to store returns of episodes
         ep_rewards = np.zeros(len(self.reward_tags))
@@ -98,7 +101,7 @@ class CMDPEvaluator(Evaluator):
     def __init__(self, args: Dict[str, Any], logger: Logger, device: th.device, envs: gym.Env = None) -> None:
         super().__init__(args, logger, device, envs)
 
-    def evaluate(self, glob_step: int, model: object, eval_ep: int = 3) -> None:
+    def evaluate(self, glob_step: int, model: object, eval_ep: int = None) -> None:
         """Evaluate the model over a specified number of episodes.
 
         Args:
@@ -107,6 +110,7 @@ class CMDPEvaluator(Evaluator):
             eval_ep: Number of episodes for evaluation.
         """
         
+        eval_ep = eval_ep or self.eval_episodes
         ep_survivals: Deque[float] = deque(maxlen=eval_ep)  # Queue to store survival rates of episodes
         ep_returns: Deque[float] = deque(maxlen=eval_ep)  # Queue to store returns of episodes
         ep_cost_returns: Deque[float] = deque(maxlen=eval_ep)  # Queue to store cost returns of episodes

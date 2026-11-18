@@ -6,15 +6,16 @@
 # budgets: vanilla / redispatch 2M agent steps; heuristic (I/R) 500k agent steps (each spans many grid steps).
 # eval: --eval-freq 50000 (2M runs) / 25000 (500k runs); defaults (PPO 10k, DQN 500, SAC/TD3 1k) make the
 #       single-threaded in-process evaluation dominate once episodes get long (up to 8064 steps x 3 episodes).
-PPO_T_V	2	--action-type topology --alg PPO --async-collect True --total-timesteps 2000000 --eval-freq 50000
-PPO_T_I	2	--action-type topology --alg PPO --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000
-PPO_T_R	2	--action-type topology --alg PPO --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000
-PPO_R	2	--action-type redispatch --alg PPO --async-collect True --total-timesteps 2000000 --eval-freq 50000
-DQN_T_V	2	--action-type topology --alg DQN --async-collect True --total-timesteps 2000000 --eval-freq 50000
-DQN_T_I	2	--action-type topology --alg DQN --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000
-DQN_T_R	2	--action-type topology --alg DQN --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000
-TD3_R	2	--action-type redispatch --alg TD3 --async-collect True --total-timesteps 2000000 --eval-freq 50000
-SAC_T_V	2	--action-type topology --alg SAC --async-collect True --total-timesteps 2000000 --eval-freq 50000 --train-freq 50
-SAC_T_I	2	--action-type topology --alg SAC --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000 --train-freq 50
-SAC_T_R	2	--action-type topology --alg SAC --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000 --train-freq 50
-SAC_R	2	--action-type redispatch --alg SAC --async-collect True --total-timesteps 2000000 --eval-freq 50000 --train-freq 50
+#       --eval-episodes 10 (original 3): 3 episodes swung 29%..97% between consecutive evals in smoke tests.
+PPO_T_V	2	--action-type topology --alg PPO --async-collect True --total-timesteps 2000000 --eval-freq 50000 --eval-episodes 10
+PPO_T_I	2	--action-type topology --alg PPO --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000 --eval-episodes 10
+PPO_T_R	2	--action-type topology --alg PPO --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000 --eval-episodes 10
+PPO_R	2	--action-type redispatch --alg PPO --async-collect True --total-timesteps 2000000 --eval-freq 50000 --eval-episodes 10
+DQN_T_V	2	--action-type topology --alg DQN --async-collect True --total-timesteps 2000000 --eval-freq 50000 --eval-episodes 10
+DQN_T_I	2	--action-type topology --alg DQN --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000 --eval-episodes 10
+DQN_T_R	2	--action-type topology --alg DQN --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000 --eval-episodes 10
+TD3_R	2	--action-type redispatch --alg TD3 --async-collect True --total-timesteps 2000000 --eval-freq 50000 --eval-episodes 10
+SAC_T_V	2	--action-type topology --alg SAC --async-collect True --total-timesteps 2000000 --eval-freq 50000 --train-freq 50 --eval-episodes 10
+SAC_T_I	2	--action-type topology --alg SAC --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000 --train-freq 50 --eval-episodes 10
+SAC_T_R	2	--action-type topology --alg SAC --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000 --train-freq 50 --eval-episodes 10
+SAC_R	2	--action-type redispatch --alg SAC --async-collect True --total-timesteps 2000000 --eval-freq 50000 --train-freq 50 --eval-episodes 10

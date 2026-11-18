@@ -109,6 +109,8 @@ if __name__ == "__main__":
     parser.add_argument("--resume-run-name", type=str, default='', help="Run name to resume")
     parser.add_argument("--async-collect", type=str2bool, default=False,
                         help="Barrier-free rollout collection (PPO only); off = original AsyncVectorEnv")
+    parser.add_argument("--eval-episodes", type=int, default=3,
+                        help="Episodes per evaluation (original: 3). Each full episode is up to 8064 steps.")
     parser.add_argument("--shared-action-space", type=str2bool, default=False,
                         help="Serve topology actions from a multiprocessing.Manager (original, slow); "
                              "default False gives each forked worker a local copy of the same action list")

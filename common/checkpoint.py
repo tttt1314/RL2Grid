@@ -46,9 +46,11 @@ class CheckpointSaver(ABC):
 
     def save(self) -> None:
         """Save the current record to a checkpoint file."""
-        th.save(
-            self.record, self.ckpt_dir + '/' + self.run_name + '.tar'
-        )
+        # Atomic: write a temp file and rename, so an interrupted save never leaves a truncated checkpoint
+        final = self.ckpt_dir + '/' + self.run_name + '.tar'
+        tmp = final + '.tmp'
+        th.save(self.record, tmp)
+        os.replace(tmp, final)
 
     @abstractmethod
     def set_record(self) -> None:

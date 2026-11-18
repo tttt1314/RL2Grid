@@ -38,13 +38,24 @@ PYTHON = HOME / "miniconda3" / "envs" / "rl2grid" / "bin" / "python"
 # Launcher: turn SIGTERM (Spot preemption / shutdown) into KeyboardInterrupt so RL2Grid's
 # `finally:` block still saves the checkpoint, then run main.py as __main__.
 LAUNCHER = (
-    "import signal,sys,runpy;"
-    "signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()));"
-    # a nohup'ed / backgrounded parent leaves SIGINT ignored, and Python then never raises KeyboardInterrupt
-    "signal.signal(signal.SIGINT, signal.default_int_handler);"
-    "sys.argv=['main.py']+sys.argv[1:];"
-    "runpy.run_path('main.py', run_name='__main__')"
+    "import signal,sys,runpy\n"
+    "def _stop(*a):\n"
+    # first SIGTERM/SIGINT -> KeyboardInterrupt; later ones (e.g. the queue AND systemd both signalling at
+    # shutdown) are ignored so they cannot interrupt RL2Grid's finally: while it writes the checkpoint
+    "    signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+    "    raise KeyboardInterrupt\n"
+    "signal.signal(signal.SIGTERM, _stop)\n"
+    # a nohup'ed / backgrounded parent leaves SIGINT ignored; install the handler explicitly
+    "signal.signal(signal.SIGINT, _stop)\n"
+    "sys.argv=['main.py']+sys.argv[1:]\n"
+    "runpy.run_path('main.py', run_name='__main__')\n"
 )
+
+
+def ckpt_ok(path: Path) -> bool:
+    """torch.save writes a zip archive; a truncated/interrupted file is not a valid zip."""
+    import zipfile
+    return path.exists() and zipfile.is_zipfile(path)
 
 EVAL_RE = re.compile(r"Eval at step (\d+)")
 
@@ -100,11 +111,18 @@ class Job:
         if self.run_name:
             # RL2Grid deletes checkpoint/<run>.tar right after loading it, so keep a backup
             # in case this segment dies before its `finally:` re-saves it.
-            ckpt = CKPT_DIR / f"{self.run_name}.tar"
-            if not ckpt.exists() and (self.dir / "backup.tar").exists():
-                shutil.copy2(self.dir / "backup.tar", ckpt)
-            shutil.copy2(ckpt, self.dir / "backup.tar")
-            args += ["--resume-run-name", self.run_name]
+            ckpt, backup = CKPT_DIR / f"{self.run_name}.tar", self.dir / "backup.tar"
+            if not ckpt_ok(ckpt):
+                if ckpt_ok(backup):
+                    log(f"WARN  {self.id}: checkpoint missing/corrupt, restoring last good backup")
+                    shutil.copy2(backup, ckpt)
+                else:
+                    log(f"WARN  {self.id}: no valid checkpoint or backup, restarting this run from scratch")
+                    for f in (ckpt, backup, self.dir / "run_name"): f.unlink(missing_ok=True)
+            if ckpt_ok(ckpt):
+                shutil.copy2(ckpt, backup)   # only ever back up a valid checkpoint
+            if self.run_name:
+                args += ["--resume-run-name", self.run_name]
         logf = open(self.dir / f"seg_{seg:03d}.log", "w")
         self.t0 = time.time()
         (self.dir / "seg_t0").write_text(str(self.t0))   # lets a restarted queue claim this segment's checkpoint

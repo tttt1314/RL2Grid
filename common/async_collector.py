@@ -103,7 +103,10 @@ class AsyncCollector:
     def reset(self, seed=None):
         for i, r in enumerate(self.remotes):
             r.send(("reset", None if seed is None else seed + i))
-        self.obs = np.stack([self._recv(i) for i in range(self.num_envs)])
+        # Cast to the declared dtype (float32) like AsyncVectorEnv's shared memory does; NormalizeObservation
+        # emits float64, which the off-policy networks would reject. Later writes into self.obs keep this dtype.
+        dtype = getattr(self.single_observation_space, "dtype", np.float32) or np.float32
+        self.obs = np.stack([self._recv(i) for i in range(self.num_envs)]).astype(dtype)
         return self.obs, {}
 
     def _drain_pending(self) -> None:
@@ -231,7 +234,8 @@ class AsyncCollector:
         out, self._carry = out[:n], out[n:]
         self.n_transitions_total += n
         o, no, a, r, t = zip(*out)
-        return {"obs": np.stack(o), "next_obs": np.stack(no), "actions": np.stack(a),
+        dt = self.obs.dtype
+        return {"obs": np.stack(o).astype(dt), "next_obs": np.stack(no).astype(dt), "actions": np.stack(a),
                 "rewards": np.asarray(r, dtype=np.float32), "terminations": np.asarray(t, dtype=np.float32)}
 
 

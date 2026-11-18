@@ -65,7 +65,13 @@ def main(args: Namespace) -> None:
     set_torch(args.n_threads, args.th_deterministic, args.cuda)
     
     # Resume run if checkpoint was resumed
-    if checkpoint.resumed: args = checkpoint.loaded_run['args']
+    if checkpoint.resumed:
+        cli = args
+        args = checkpoint.loaded_run['args']
+        # Execution-only settings follow the command line on resume (they do not change what is learned),
+        # so runs started before a flag existed still pick it up.
+        for k in ("eval_workers", "n_threads"):
+            if hasattr(cli, k): setattr(args, k, getattr(cli, k))
 
     # Create multiple async environments for parallel processing
     main_gym_env, main_g2o_env = auxiliary_make_env(args, checkpoint.resumed)

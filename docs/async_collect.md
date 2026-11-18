@@ -1,6 +1,6 @@
 # 非同步收集（Async Collect）說明
 
-> 適用：RL2Grid PPO（`--async-collect True`），分支 `feat/async-collect`
+> 適用：RL2Grid PPO、DQN、SAC、TD3（`--async-collect True`），分支 `dev/fixed-async`（PPO 版本最早在 `feat/async-collect`）
 > 一句話：**不再讓 50 個環境每一步都互相等待，誰先跑完就先處理誰。**
 
 ---
@@ -136,7 +136,7 @@ python main.py --env-id bus14 --action-type topology --alg PPO \
 ```
 
 - 預設 **關閉**，不加參數就和原版完全相同。
-- 目前 **只支援 PPO**；其他演算法開啟會直接報錯（`NotImplementedError`）。
+- 支援 **PPO、DQN、SAC、TD3**；LagrPPO 開啟會直接報錯（`NotImplementedError`）。
 - 可以搭配 `--checkpoint True` / `--resume-run-name` 使用，接續後仍然是非同步模式。
 
 ---
@@ -151,7 +151,26 @@ python main.py --env-id bus14 --action-type topology --alg PPO \
 
 ---
 
-## 8. 相關檔案
+## 8. Off-policy 版本（DQN / SAC / TD3）
+
+off-policy 不要求一批資料來自同一個策略，所以比 PPO 更簡單：
+
+- `collect_transitions(act_fn, n)` 每次回傳剛好 `n`（= `n_envs`）筆資料，直接放進 replay buffer。
+- **回傳時不等還在跑的環境**：它們在網路更新期間繼續模擬，結果在下一次呼叫時取回，一筆都不會丟。
+- 因為每次仍然剛好 `n_envs` 筆，原本所有依 `global_step % ...` 決定的排程（更新、target 網路、評估）完全不用改。
+- 動作的選擇被包成 `act_fn`：同步路徑呼叫 `act_fn(obs)`，行為和原版完全相同。
+
+| bus14 實測（32 vCPU，各自單獨跑） | 同步 | 非同步 |
+|---|---|---|
+| DQN + Idle 啟發式 | 16 SPS | **46 SPS** |
+| DQN 原始版 | 418 SPS | **889 SPS** |
+| SAC + Idle 啟發式 | — | 36 SPS |
+| SAC 再調度 | — | 435 SPS |
+| TD3 再調度 | — | 1,732 SPS |
+
+> SAC 必須加 `--train-freq 50`（論文 Table F.1 的值）；程式碼預設的 20 會違反 `train_freq % n_envs == 0` 的檢查而無法啟動。
+
+## 9. 相關檔案
 
 | 檔案 | 內容 |
 |---|---|

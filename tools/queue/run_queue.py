@@ -53,9 +53,14 @@ LAUNCHER = (
 
 
 def ckpt_ok(path: Path) -> bool:
-    """torch.save writes a zip archive; a truncated/interrupted file is not a valid zip."""
+    """A torch.save archive must contain .../data.pkl and pass the zip CRC check.
+    (zipfile.is_zipfile alone accepted an 825-byte truncated checkpoint that torch could not load.)"""
     import zipfile
-    return path.exists() and zipfile.is_zipfile(path)
+    try:
+        with zipfile.ZipFile(path) as z:
+            return any(n.endswith("data.pkl") for n in z.namelist()) and z.testzip() is None
+    except (OSError, zipfile.BadZipFile):
+        return False
 
 EVAL_RE = re.compile(r"Eval at step (\d+)")
 

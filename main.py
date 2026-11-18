@@ -122,6 +122,8 @@ if __name__ == "__main__":
     # Torch
     parser.add_argument("--th-deterministic", type=str2bool, default=True, help="Enable deterministic in Torch.")
     parser.add_argument("--cuda", type=str2bool, default=False, help="Enable CUDA by default.")
-    parser.add_argument("--n-threads", type=int, default=12, help="Max number of torch threads.")
+    # 1 thread: the conda torch build uses OpenBLAS, and torch intra-op threads x OpenBLAS threads oversubscribe
+    # the CPU (PPO update on bus14: 1 thread 11 s, 12 threads 69 s). Matmuls are still parallelised by OpenBLAS.
+    parser.add_argument("--n-threads", type=int, default=1, help="Max number of torch threads.")
 
     main(parser.parse_known_args()[0])

@@ -7,18 +7,20 @@
 # budgets: vanilla / redispatch 5M agent steps; heuristic (I/R) 500k agent steps (each spans many grid steps).
 # eval: --eval-freq 50000 (2M runs) / 25000 (500k runs); defaults (PPO 10k, DQN 500, SAC/TD3 1k) make the
 #       single-threaded in-process evaluation dominate once episodes get long (up to 8064 steps x 3 episodes).
+#       --eval-workers 10: the 10 episodes run in parallel processes; sequential evaluation took ~220 s per eval
+#       once PPO-V reached ~70% survival and dominated wall time.
 #       --eval-episodes 10 (original 3): 3 episodes swung 29%..97% between consecutive evals in smoke tests.
-PPO_T_V	2	--action-type topology --alg PPO --async-collect True --total-timesteps 5000000 --eval-freq 50000 --eval-episodes 10
-PPO_T_I	2	--action-type topology --alg PPO --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000 --eval-episodes 10
-PPO_T_R	2	--action-type topology --alg PPO --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000 --eval-episodes 10
-PPO_R	2	--action-type redispatch --alg PPO --async-collect True --total-timesteps 5000000 --eval-freq 50000 --eval-episodes 10
-DQN_T_V	2	--action-type topology --alg DQN --async-collect True --total-timesteps 5000000 --eval-freq 50000 --eval-episodes 10
-DQN_T_I	2	--action-type topology --alg DQN --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000 --eval-episodes 10
-DQN_T_R	2	--action-type topology --alg DQN --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000 --eval-episodes 10
-TD3_R	2	--action-type redispatch --alg TD3 --async-collect True --total-timesteps 5000000 --eval-freq 50000 --eval-episodes 10
-SAC_T_V	2	--action-type topology --alg SAC --async-collect True --total-timesteps 5000000 --eval-freq 50000 --train-freq 50 --eval-episodes 10
-SAC_T_I	2	--action-type topology --alg SAC --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000 --train-freq 50 --eval-episodes 10
-SAC_T_R	2	--action-type topology --alg SAC --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000 --train-freq 50 --eval-episodes 10
-SAC_R	2	--action-type redispatch --alg SAC --async-collect True --total-timesteps 5000000 --eval-freq 50000 --train-freq 50 --eval-episodes 10
-LAGRPPO_C1	2	--action-type topology --alg LAGRPPO --constraints-type 1 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10
-LAGRPPO_C2	2	--action-type topology --alg LAGRPPO --constraints-type 2 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10
+PPO_T_V	2	--action-type topology --alg PPO --async-collect True --total-timesteps 5000000 --eval-freq 50000 --eval-episodes 10 --eval-workers 10
+PPO_T_I	2	--action-type topology --alg PPO --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000 --eval-episodes 10 --eval-workers 10
+PPO_T_R	2	--action-type topology --alg PPO --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000 --eval-episodes 10 --eval-workers 10
+PPO_R	2	--action-type redispatch --alg PPO --async-collect True --total-timesteps 5000000 --eval-freq 50000 --eval-episodes 10 --eval-workers 10
+DQN_T_V	2	--action-type topology --alg DQN --async-collect True --total-timesteps 5000000 --eval-freq 50000 --eval-episodes 10 --eval-workers 10
+DQN_T_I	2	--action-type topology --alg DQN --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000 --eval-episodes 10 --eval-workers 10
+DQN_T_R	2	--action-type topology --alg DQN --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000 --eval-episodes 10 --eval-workers 10
+TD3_R	2	--action-type redispatch --alg TD3 --async-collect True --total-timesteps 5000000 --eval-freq 50000 --eval-episodes 10 --eval-workers 10
+SAC_T_V	2	--action-type topology --alg SAC --async-collect True --total-timesteps 5000000 --eval-freq 50000 --train-freq 50 --eval-episodes 10 --eval-workers 10
+SAC_T_I	2	--action-type topology --alg SAC --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000 --train-freq 50 --eval-episodes 10 --eval-workers 10
+SAC_T_R	2	--action-type topology --alg SAC --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000 --train-freq 50 --eval-episodes 10 --eval-workers 10
+SAC_R	2	--action-type redispatch --alg SAC --async-collect True --total-timesteps 5000000 --eval-freq 50000 --train-freq 50 --eval-episodes 10 --eval-workers 10
+LAGRPPO_C1	2	--action-type topology --alg LAGRPPO --constraints-type 1 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10 --eval-workers 10
+LAGRPPO_C2	2	--action-type topology --alg LAGRPPO --constraints-type 2 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10 --eval-workers 10

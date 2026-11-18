@@ -109,6 +109,8 @@ if __name__ == "__main__":
     parser.add_argument("--resume-run-name", type=str, default='', help="Run name to resume")
     parser.add_argument("--async-collect", type=str2bool, default=False,
                         help="Barrier-free rollout collection (PPO only); off = original AsyncVectorEnv")
+    parser.add_argument("--eval-workers", type=int, default=1,
+                        help="Processes for evaluation episodes (1 = original sequential evaluation in the main process)")
     parser.add_argument("--eval-episodes", type=int, default=3,
                         help="Episodes per evaluation (original: 3). Each full episode is up to 8064 steps.")
     parser.add_argument("--shared-action-space", type=str2bool, default=False,

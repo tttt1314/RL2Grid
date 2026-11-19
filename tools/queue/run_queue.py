@@ -37,19 +37,28 @@ PYTHON = HOME / "miniconda3" / "envs" / "rl2grid" / "bin" / "python"
 
 # Launcher: turn SIGTERM (Spot preemption / shutdown) into KeyboardInterrupt so RL2Grid's
 # `finally:` block still saves the checkpoint, then run main.py as __main__.
-LAUNCHER = (
-    "import signal,sys,runpy\n"
-    "def _stop(*a):\n"
-    # first SIGTERM/SIGINT -> KeyboardInterrupt; later ones (e.g. the queue AND systemd both signalling at
-    # shutdown) are ignored so they cannot interrupt RL2Grid's finally: while it writes the checkpoint
-    "    signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
-    "    raise KeyboardInterrupt\n"
-    "signal.signal(signal.SIGTERM, _stop)\n"
-    # a nohup'ed / backgrounded parent leaves SIGINT ignored; install the handler explicitly
-    "signal.signal(signal.SIGINT, _stop)\n"
-    "sys.argv=['main.py']+sys.argv[1:]\n"
-    "runpy.run_path('main.py', run_name='__main__')\n"
-)
+# Signals arriving within `window` seconds of the last one are ignored, so the queue AND systemd both
+# signalling at shutdown cannot interrupt the checkpoint write. The window is finite (not "ignore forever"):
+# a KeyboardInterrupt swallowed during env initialisation left a run that no SIGTERM could stop, so the
+# queue re-sends SIGTERM every RESEND_SEC until the job exits.
+RESEND_SEC = 120
+
+
+def launcher(window: float) -> str:
+    return (
+        "import signal,sys,runpy,time\n"
+        "_last=[None]\n"
+        "def _stop(*a):\n"
+        "    now=time.monotonic()\n"
+        f"    if _last[0] is not None and now-_last[0]<{window}: return\n"
+        "    _last[0]=now\n"
+        "    raise KeyboardInterrupt\n"
+        "signal.signal(signal.SIGTERM, _stop)\n"
+        # a nohup'ed / backgrounded parent leaves SIGINT ignored; install the handler explicitly
+        "signal.signal(signal.SIGINT, _stop)\n"
+        "sys.argv=['main.py']+sys.argv[1:]\n"
+        "runpy.run_path('main.py', run_name='__main__')\n"
+    )
 
 
 def ckpt_ok(path: Path) -> bool:
@@ -84,13 +93,15 @@ def load_jobs(path: Path, seeds: list[int]) -> list[dict]:
 
 
 class Job:
-    def __init__(self, spec: dict, segment_min: int):
+    def __init__(self, spec: dict, segment_min: int, resend_sec: float = RESEND_SEC):
         self.__dict__.update(spec)
         self.dir = STATE / self.id
         self.dir.mkdir(parents=True, exist_ok=True)
         self.segment_min = segment_min
         self.proc: subprocess.Popen | None = None
         self.interrupted = False
+        self.resend_sec = resend_sec
+        self.last_term = 0.0
         self.t0 = 0.0
 
     # ---- persistent state -------------------------------------------------------------
@@ -131,7 +142,7 @@ class Job:
         logf = open(self.dir / f"seg_{seg:03d}.log", "w")
         self.t0 = time.time()
         (self.dir / "seg_t0").write_text(str(self.t0))   # lets a restarted queue claim this segment's checkpoint
-        self.proc = subprocess.Popen([str(PYTHON), "-u", "-c", LAUNCHER, *args], cwd=RL2GRID,
+        self.proc = subprocess.Popen([str(PYTHON), "-u", "-c", launcher(0.75 * self.resend_sec), *args], cwd=RL2GRID,
                                      stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
         log(f"START {self.id} seg={seg} resume={self.run_name or '-'} pid={self.proc.pid}")
 
@@ -169,8 +180,12 @@ class Job:
         if not self.run_name:  # first segment: find the checkpoint this process just wrote
             self.claim(claimed, self.t0)
         step = self.last_step()
-        finished_early = elapsed_min < 0.9 * self.segment_min and self.proc.returncode == 0
-        if step >= self.budget * 0.98 or (finished_early and step > 0):
+        clean = self.proc.returncode == 0
+        finished_early = elapsed_min < 0.9 * self.segment_min and clean
+        # Only a clean exit counts: the log can show evals past the checkpoint when a segment was killed
+        # (SIGKILL loses everything since the last save), so a budget-reaching log of a killed run is not DONE.
+        # An interrupted run that did save resumes, ends its loop at once and exits cleanly -> DONE then.
+        if (step >= self.budget * 0.98 and clean) or (finished_early and step > 0):
             (self.dir / "DONE").write_text(f"step={step}\n")
             log(f"DONE  {self.id} step={step}")
         else:
@@ -187,6 +202,14 @@ class Job:
             # SIGTERM to the main process only: the launcher turns it into KeyboardInterrupt, RL2Grid's finally:
             # saves the checkpoint and closes its workers. (SIGINT may be ignored when started via nohup/&.)
             os.kill(self.proc.pid, signal.SIGTERM)
+            self.last_term = time.time()
+
+    def resend(self) -> None:
+        """Re-signal a job that is still alive RESEND_SEC after the last SIGTERM (its first one may have been
+        swallowed during start-up). The launcher ignores signals inside its window, so an ongoing save is safe."""
+        if self.proc and self.proc.poll() is None and time.time() - self.last_term >= self.resend_sec:
+            log(f"RESEND {self.id}: still running, sending SIGTERM again")
+            self.interrupt()
 
 
 def main() -> None:
@@ -195,10 +218,12 @@ def main() -> None:
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     ap.add_argument("--max-slots", type=int, default=4)
     ap.add_argument("--segment-min", type=int, default=360)  # most off-policy runs finish in one segment
+    ap.add_argument("--resend-sec", type=float, default=RESEND_SEC,
+                    help="re-send SIGTERM to a job still alive this long after the last one (when stopping)")
     ap.add_argument("--only", nargs="*", default=None, help="run only these job-name prefixes")
     a = ap.parse_args()
 
-    jobs = [Job(s, a.segment_min) for s in load_jobs(Path(a.jobs), a.seeds)]
+    jobs = [Job(s, a.segment_min, a.resend_sec) for s in load_jobs(Path(a.jobs), a.seeds)]
     if a.only:
         jobs = [j for j in jobs if any(j.id.startswith(p) for p in a.only)]
     claimed = {j.run_name for j in jobs if j.run_name}
@@ -223,6 +248,7 @@ def main() -> None:
                 break
             for j in running:   # also covers a job started between the signal and its running.append()
                 if not j.interrupted: j.interrupt()
+                else: j.resend()
             time.sleep(2)
             continue
         pending = [j for j in jobs if not j.done and not (j.dir / "FAILED").exists() and j not in running]

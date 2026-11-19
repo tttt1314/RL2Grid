@@ -221,16 +221,22 @@ def main() -> None:
         if stopping:
             if not running:
                 break
+            for j in running:   # also covers a job started between the signal and its running.append()
+                if not j.interrupted: j.interrupt()
             time.sleep(2)
             continue
         pending = [j for j in jobs if not j.done and not (j.dir / "FAILED").exists() and j not in running]
         used = sum(j.slots for j in running)
         for j in pending:
+            if stopping:   # SIGTERM may arrive during the stagger sleep below: never start a job after it
+                break
             if used + j.slots <= a.max_slots:
                 j.start()
                 running.append(j)
                 used += j.slots
                 time.sleep(20)  # stagger env initialisation
+        if stopping:
+            continue
         if not running and not pending:
             log("ALL JOBS FINISHED")
             break

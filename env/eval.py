@@ -1,3 +1,4 @@
+import io
 from collections import deque
 from copy import deepcopy
 
@@ -38,7 +39,8 @@ def _eval_worker(remote, parent_remote, args, idx: int, n_tags: int) -> None:
         while True:
             cmd, data = remote.recv()
             if cmd == "close": break
-            model, obs_rms, n_ep, cmdp = data
+            model_bytes, obs_rms, n_ep, cmdp = data
+            model = th.load(io.BytesIO(model_bytes), weights_only=False)
             remote.send(("ok", [_eval_episode(env, model, obs_rms, args.use_heuristic, n_tags, max_steps, cmdp)
                                 for _ in range(n_ep)]))
     except (KeyboardInterrupt, EOFError):
@@ -70,10 +72,15 @@ class EvalPool:
     def run(self, model, obs_rms, n_episodes: int, cmdp: bool) -> list:
         n = len(self.remotes)
         split = [n_episodes // n + (1 if i < n_episodes % n else 0) for i in range(n)]
-        model_cpu = deepcopy(model).cpu()
+        # Send the policy as plain bytes. Pickling a module/tensors directly through the pipe uses torch's
+        # ForkingPickler reduction, which shares every tensor via a passed file descriptor; over hours of
+        # evaluations this crashed with "RuntimeError: received 0 items of ancdata" (fd passing exhausted).
+        buf = io.BytesIO()
+        th.save(deepcopy(model).cpu(), buf)
+        model_bytes = buf.getvalue()
         busy = []
         for r, k in zip(self.remotes, split):
-            if k: r.send(("run", (model_cpu, obs_rms, k, cmdp))); busy.append(r)
+            if k: r.send(("run", (model_bytes, obs_rms, k, cmdp))); busy.append(r)
         out = []
         for r in busy: out += self._check(r.recv())
         return out

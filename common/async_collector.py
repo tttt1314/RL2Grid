@@ -38,12 +38,13 @@ def _worker(remote, parent_remote, env_fn: Callable) -> None:
         while True:
             cmd, data = remote.recv()
             if cmd == "step":
-                obs, reward, terminated, truncated, _ = env.step(data)
+                obs, reward, terminated, truncated, info = env.step(data)
                 final_obs = None
                 if terminated or truncated:  # autoreset, mirroring gymnasium 0.29 AsyncVectorEnv
                     final_obs = obs
                     obs, _ = env.reset()
-                remote.send(("ok", (obs, float(reward), bool(terminated), bool(truncated), final_obs)))
+                cost = float(info.get("cost", 0.0))  # CMDP wrappers only; taken before the autoreset
+                remote.send(("ok", (obs, float(reward), bool(terminated), bool(truncated), final_obs, cost)))
             elif cmd == "reset":
                 obs, _ = env.reset(seed=data)
                 remote.send(("ok", obs))
@@ -112,7 +113,7 @@ class AsyncCollector:
     def _drain_pending(self) -> None:
         """Finish in-flight off-policy steps (kept for the next collect) so the pipes are idle."""
         for i in list(getattr(self, "_pending", {})):
-            next_obs, reward, terminated, truncated, final_obs = self._recv(i)
+            next_obs, reward, terminated, truncated, final_obs, _ = self._recv(i)
             obs, action = self._pending.pop(i)
             real_next = final_obs if final_obs is not None else next_obs
             self._carry.append((obs, real_next, action, reward, terminated))
@@ -136,17 +137,18 @@ class AsyncCollector:
 
     # ------------------------------------------------------------------ rollout
     @th.no_grad()
-    def collect(self, agent, n_transitions: int, device: th.device) -> Dict[str, list]:
+    def collect(self, agent, n_transitions: int, device: th.device, with_cost: bool = False) -> Dict[str, list]:
         """Collect exactly `n_transitions` on-policy transitions without per-step barriers.
 
         Returns per-worker segments (lists of tensors) plus the bootstrap value of each
-        worker's last observation.
+        worker's last observation. `with_cost` (LagrPPO) also records the CMDP cost and the
+        cost-critic values/bootstrap.
         """
         if self.obs is None:
             self.reset()
         n = self.num_envs
         seg = {k: [[] for _ in range(n)] for k in ("obs", "actions", "logprobs", "values", "rewards",
-                                                    "terminations", "dones")}
+                                                    "terminations", "dones", "costs", "cost_values")}
         ready = list(range(n))
         in_flight = set()
         dispatched = 0
@@ -161,6 +163,7 @@ class AsyncCollector:
                 obs_t = th.as_tensor(self.obs[idx], dtype=th.float32, device=device)
                 action, logprob, _ = agent.get_action(obs_t)
                 value = agent.get_value(obs_t).flatten()
+                cost_value = agent.get_cost_value(obs_t).flatten() if with_cost else None
                 act_np = action.cpu().numpy()
                 if self._clip is not None:  # stored action (for the log-prob) stays unclipped, as in sync PPO
                     act_np = np.clip(act_np, *self._clip)
@@ -169,6 +172,7 @@ class AsyncCollector:
                     seg["actions"][i].append(action[k])
                     seg["logprobs"][i].append(logprob[k])
                     seg["values"][i].append(value[k])
+                    if with_cost: seg["cost_values"][i].append(cost_value[k])
                     self.remotes[i].send(("step", act_np[k]))
                     in_flight.add(i)
                 dispatched += len(idx)
@@ -179,9 +183,10 @@ class AsyncCollector:
             idle_waits += 1
             for conn in conns:
                 i = self.remotes.index(conn)
-                next_obs, reward, terminated, truncated, final_obs = self._recv(i)
+                next_obs, reward, terminated, truncated, final_obs, cost = self._recv(i)
                 in_flight.discard(i)
                 seg["rewards"][i].append(reward)
+                seg["costs"][i].append(cost)
                 seg["terminations"][i].append(int(terminated))
                 seg["dones"][i].append(int(terminated or truncated))
                 self.obs[i] = next_obs
@@ -189,9 +194,11 @@ class AsyncCollector:
                     ready.append(i)
 
         # bootstrap values for the last observation of every worker that collected data
-        boot = agent.get_value(th.as_tensor(self.obs, dtype=th.float32, device=device)).flatten()
+        last_obs = th.as_tensor(self.obs, dtype=th.float32, device=device)
+        boot = agent.get_value(last_obs).flatten()
         self.n_transitions_total += dispatched
         seg["bootstrap"] = boot
+        if with_cost: seg["cost_bootstrap"] = agent.get_cost_value(last_obs).flatten()
         seg["n_waits"] = idle_waits
         return seg
 
@@ -226,7 +233,7 @@ class AsyncCollector:
                     self.remotes[i].send(("step", actions[k]))
             for conn in wait([self.remotes[i] for i in self._pending]):
                 i = self.remotes.index(conn)
-                next_obs, reward, terminated, truncated, final_obs = self._recv(i)
+                next_obs, reward, terminated, truncated, final_obs, _ = self._recv(i)
                 obs, action = self._pending.pop(i)
                 real_next = final_obs if final_obs is not None else next_obs
                 out.append((obs, real_next, action, reward, terminated))
@@ -239,33 +246,49 @@ class AsyncCollector:
                 "rewards": np.asarray(r, dtype=np.float32), "terminations": np.asarray(t, dtype=np.float32)}
 
 
-def compute_segment_gae(seg: Dict[str, list], gamma: float, gae_lambda: float, device: th.device):
+def _gae(values, rewards, terms, dones, bootstrap, gamma: float, gae_lambda: float):
+    L = len(values)
+    adv = th.zeros(L, device=values.device)
+    lastgaelam = 0.0
+    for t in reversed(range(L)):
+        nextvalue = bootstrap if t == L - 1 else values[t + 1]
+        delta = rewards[t] + gamma * nextvalue * (1 - terms[t]) - values[t]
+        adv[t] = lastgaelam = delta + gamma * gae_lambda * (1 - dones[t]) * lastgaelam
+    return adv
+
+
+def compute_segment_gae(seg: Dict[str, list], gamma: float, gae_lambda: float, device: th.device,
+                        with_cost: bool = False):
     """Per-worker GAE on variable-length segments; returns flat batch tensors.
 
     Uses exactly the same recursion as RL2Grid's synchronous PPO:
         delta_t = r_t + gamma * V_{t+1} * (1 - term_t) - V_t
         A_t     = delta_t + gamma * lambda * (1 - done_t) * A_{t+1}
     where V_{t+1} for the last step of a segment is the value of the worker's current observation.
+    `with_cost` (LagrPPO) runs the same recursion on the costs with the cost critic.
     """
-    out = {k: [] for k in ("obs", "actions", "logprobs", "values", "advantages", "returns")}
+    keys = ["obs", "actions", "logprobs", "values", "advantages", "returns"]
+    if with_cost: keys += ["cost_values", "cost_advantages", "cost_returns"]
+    out = {k: [] for k in keys}
+    f32 = dict(dtype=th.float32, device=device)
     for i in range(len(seg["obs"])):
-        L = len(seg["obs"][i])
-        if L == 0:
+        if len(seg["obs"][i]) == 0:
             continue
+        terms = th.tensor(seg["terminations"][i], **f32)
+        dones = th.tensor(seg["dones"][i], **f32)
         values = th.stack(seg["values"][i])
-        rewards = th.tensor(seg["rewards"][i], dtype=th.float32, device=device)
-        terms = th.tensor(seg["terminations"][i], dtype=th.float32, device=device)
-        dones = th.tensor(seg["dones"][i], dtype=th.float32, device=device)
-        adv = th.zeros(L, device=device)
-        lastgaelam = 0.0
-        for t in reversed(range(L)):
-            nextvalue = seg["bootstrap"][i] if t == L - 1 else values[t + 1]
-            delta = rewards[t] + gamma * nextvalue * (1 - terms[t]) - values[t]
-            adv[t] = lastgaelam = delta + gamma * gae_lambda * (1 - dones[t]) * lastgaelam
+        adv = _gae(values, th.tensor(seg["rewards"][i], **f32), terms, dones, seg["bootstrap"][i], gamma, gae_lambda)
         out["obs"].append(th.stack(seg["obs"][i]))
         out["actions"].append(th.stack(seg["actions"][i]))
         out["logprobs"].append(th.stack(seg["logprobs"][i]))
         out["values"].append(values)
         out["advantages"].append(adv)
         out["returns"].append(adv + values)
+        if with_cost:
+            cvalues = th.stack(seg["cost_values"][i])
+            cadv = _gae(cvalues, th.tensor(seg["costs"][i], **f32), terms, dones, seg["cost_bootstrap"][i],
+                        gamma, gae_lambda)
+            out["cost_values"].append(cvalues)
+            out["cost_advantages"].append(cadv)
+            out["cost_returns"].append(cadv + cvalues)
     return {k: th.cat(v) for k, v in out.items()}

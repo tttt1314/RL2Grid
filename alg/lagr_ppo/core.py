@@ -4,6 +4,7 @@ from torch.nn.functional import softplus
 
 from .agent import Agent
 from .config import get_alg_args
+from common.async_collector import compute_segment_gae
 from common.checkpoint import CheckpointSaver
 from common.imports import *
 from common.logger import ConstrainedLogger
@@ -93,77 +94,105 @@ class LagrPPO:
                     actor_optim.param_groups[0]['lr'] = frac * args.actor_lr
                     critic_optim.param_groups[0]['lr'] = frac * args.critic_lr
 
-                for step in range(0, args.n_steps):
-                    global_step += args.n_envs
-                    observations[step] = next_obs
-                    
-                    with th.no_grad():
-                        action, logprob, _ = agent.get_action(next_obs)
-                        value = agent.get_value(next_obs)
-                        values[step] = value.flatten()
-                        cost_value = agent.get_cost_value(next_obs)
-                        cost_values[step] = cost_value.flatten()
-                    actions[step] = action
-                    logprobs[step] = logprob
-
-                    next_obs, reward, next_terminations, next_truncations, infos = envs.step(np.clip(action.cpu().numpy(), envs.single_action_space.low, envs.single_action_space.high) if continuous_actions else action.cpu().numpy())
-
-                    rewards[step] = th.tensor(reward).to(device).view(-1)
-                    dones[step] = th.tensor(np.logical_or(next_terminations, next_truncations)).to(device)
-                    terminations[step] = th.tensor(next_terminations).to(device)
-
-                    real_next_obs = next_obs.copy()
-                    cost = infos.get('cost', np.zeros(args.n_envs))
-                    for idx, done in enumerate(dones[step]):
-                        if done: 
-                            real_next_obs[idx] = infos["final_observation"][idx]
-                            cost[idx] =  infos["final_info"][idx]['cost']   # When done, 'cost' is also in 'final_info'
-    
-                    costs[step] = th.tensor(cost).to(device).view(-1)
-                    next_obs = th.tensor(next_obs).to(device)
-                    real_next_obs = th.tensor(real_next_obs).to(device)
-
-                    if global_step % args.eval_freq == 0:
+                if getattr(args, "async_collect", False):
+                    # Barrier-free rollout (see common/async_collector.py), with the cost critic
+                    t_roll = time()
+                    seg = envs.collect(agent, batch_size, device, with_cost=True)
+                    prev_step, global_step = global_step, global_step + batch_size
+                    # The policy is fixed within a rollout: one eval per crossed eval_freq boundary
+                    if global_step // args.eval_freq > prev_step // args.eval_freq:
                         evaluator.evaluate(global_step, agent)
-                        if args.verbose: print(f"SPS={int(global_step / (time() - start_time))}")
+                        if args.verbose:
+                            print(f"SPS={int(global_step / (time() - start_time))} "
+                                  f"rollout_s={time() - t_roll:.1f} waits={seg['n_waits']}")
 
-                # Lagrangian update
-                costs_q = costs[-int(8000/args.n_envs):, :].flatten()
-                lag_loss = -lag_mul * (th.mean(th.tensor(costs_q.sum(), dtype=th.float32)) - args.cost_threshold)
+                    # Lagrangian update: same statistic as the synchronous path, whose costs[-8000/n_envs:, :]
+                    # is the summed cost of the last 8000/n_envs steps of every env -> here, of every worker segment
+                    k = int(8000 / args.n_envs)
+                    costs_q_sum = float(sum(sum(c[-k:]) for c in seg["costs"]))
+                    lag_loss = -lag_mul * (th.tensor(costs_q_sum, dtype=th.float32) - args.cost_threshold)
+                    lag_optim.zero_grad()
+                    lag_loss.backward()
+                    lag_optim.step()
 
-                lag_optim.zero_grad()
-                lag_loss.backward()
-                lag_optim.step()
+                    with th.no_grad():
+                        batch = compute_segment_gae(seg, args.gamma, args.gae_lambda, device, with_cost=True)
+                    b_obs, b_logprobs, b_actions = batch["obs"], batch["logprobs"], batch["actions"]
+                    b_advantages, b_returns, b_values = batch["advantages"], batch["returns"], batch["values"]
+                    b_cost_advantages, b_cost_returns = batch["cost_advantages"], batch["cost_returns"]
+                    b_cost_values = batch["cost_values"]
+                else:
+                    for step in range(0, args.n_steps):
+                        global_step += args.n_envs
+                        observations[step] = next_obs
+                    
+                        with th.no_grad():
+                            action, logprob, _ = agent.get_action(next_obs)
+                            value = agent.get_value(next_obs)
+                            values[step] = value.flatten()
+                            cost_value = agent.get_cost_value(next_obs)
+                            cost_values[step] = cost_value.flatten()
+                        actions[step] = action
+                        logprobs[step] = logprob
 
-                # Bootstrap value if not done
-                with th.no_grad():
-                    advantages = th.zeros_like(rewards).to(device)
-                    cost_advantages = th.zeros_like(rewards).to(device)
-                    lastgaelam, lastcostgaelam = 0, 0
-                    for t in reversed(range(args.n_steps)):
-                        if t == args.n_steps - 1:
-                            nextvalues = agent.get_value(real_next_obs).reshape(1, -1)
-                            nextcostvalues = agent.get_cost_value(real_next_obs).reshape(1, -1)
-                        else:
-                            nextvalues = values[t + 1]
-                            nextcostvalues = cost_values[t + 1]
-                        delta = rewards[t] + args.gamma * nextvalues * (1 - terminations[t]) - values[t]
-                        advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * (1 - dones[t]) * lastgaelam
-                        cost_delta = costs[t] + args.gamma * nextcostvalues * (1 - terminations[t]) - cost_values[t]
-                        cost_advantages[t] = lastcostgaelam = cost_delta + args.gamma * args.gae_lambda * (1 - dones[t]) * lastcostgaelam
-                    returns = advantages + values
-                    cost_returns = cost_advantages + cost_values
+                        next_obs, reward, next_terminations, next_truncations, infos = envs.step(np.clip(action.cpu().numpy(), envs.single_action_space.low, envs.single_action_space.high) if continuous_actions else action.cpu().numpy())
+
+                        rewards[step] = th.tensor(reward).to(device).view(-1)
+                        dones[step] = th.tensor(np.logical_or(next_terminations, next_truncations)).to(device)
+                        terminations[step] = th.tensor(next_terminations).to(device)
+
+                        real_next_obs = next_obs.copy()
+                        cost = infos.get('cost', np.zeros(args.n_envs))
+                        for idx, done in enumerate(dones[step]):
+                            if done: 
+                                real_next_obs[idx] = infos["final_observation"][idx]
+                                cost[idx] =  infos["final_info"][idx]['cost']   # When done, 'cost' is also in 'final_info'
+    
+                        costs[step] = th.tensor(cost).to(device).view(-1)
+                        next_obs = th.tensor(next_obs).to(device)
+                        real_next_obs = th.tensor(real_next_obs).to(device)
+
+                        if global_step % args.eval_freq == 0:
+                            evaluator.evaluate(global_step, agent)
+                            if args.verbose: print(f"SPS={int(global_step / (time() - start_time))}")
+
+                    # Lagrangian update
+                    costs_q = costs[-int(8000/args.n_envs):, :].flatten()
+                    lag_loss = -lag_mul * (th.mean(th.tensor(costs_q.sum(), dtype=th.float32)) - args.cost_threshold)
+
+                    lag_optim.zero_grad()
+                    lag_loss.backward()
+                    lag_optim.step()
+
+                    # Bootstrap value if not done
+                    with th.no_grad():
+                        advantages = th.zeros_like(rewards).to(device)
+                        cost_advantages = th.zeros_like(rewards).to(device)
+                        lastgaelam, lastcostgaelam = 0, 0
+                        for t in reversed(range(args.n_steps)):
+                            if t == args.n_steps - 1:
+                                nextvalues = agent.get_value(real_next_obs).reshape(1, -1)
+                                nextcostvalues = agent.get_cost_value(real_next_obs).reshape(1, -1)
+                            else:
+                                nextvalues = values[t + 1]
+                                nextcostvalues = cost_values[t + 1]
+                            delta = rewards[t] + args.gamma * nextvalues * (1 - terminations[t]) - values[t]
+                            advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * (1 - dones[t]) * lastgaelam
+                            cost_delta = costs[t] + args.gamma * nextcostvalues * (1 - terminations[t]) - cost_values[t]
+                            cost_advantages[t] = lastcostgaelam = cost_delta + args.gamma * args.gae_lambda * (1 - dones[t]) * lastcostgaelam
+                        returns = advantages + values
+                        cost_returns = cost_advantages + cost_values
    
-                # Flatten the batch
-                b_obs = observations.reshape((-1,) + envs.single_observation_space.shape)
-                b_logprobs = logprobs.reshape(-1)
-                b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-                b_advantages = advantages.reshape(-1)
-                b_cost_advantages = cost_advantages.reshape(-1)
-                b_returns = returns.reshape(-1)
-                b_cost_returns = cost_returns.reshape(-1)
-                b_values = values.reshape(-1)
-                b_cost_values = cost_values.reshape(-1)
+                    # Flatten the batch
+                    b_obs = observations.reshape((-1,) + envs.single_observation_space.shape)
+                    b_logprobs = logprobs.reshape(-1)
+                    b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+                    b_advantages = advantages.reshape(-1)
+                    b_cost_advantages = cost_advantages.reshape(-1)
+                    b_returns = returns.reshape(-1)
+                    b_cost_returns = cost_returns.reshape(-1)
+                    b_values = values.reshape(-1)
+                    b_cost_values = cost_values.reshape(-1)
 
                 # Optimizing the policy and value network
                 b_inds = np.arange(batch_size)

@@ -97,8 +97,6 @@ def main(args: Namespace) -> None:
             
         env_fns = [lambda i=i: make_vec_subprocess(i) for i in range(args.n_envs)]
         if getattr(args, "async_collect", False):
-            if alg not in ("PPO", "DQN", "SAC", "TD3"):
-                raise NotImplementedError("--async-collect is implemented for PPO, DQN, SAC and TD3 (not LagrPPO)")
             envs = AsyncCollector(env_fns)
         else:
             envs = gym.vector.AsyncVectorEnv(env_fns)
@@ -114,7 +112,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str2bool, default=False, help="Toggles checkpoint.")
     parser.add_argument("--resume-run-name", type=str, default='', help="Run name to resume")
     parser.add_argument("--async-collect", type=str2bool, default=False,
-                        help="Barrier-free rollout collection (PPO only); off = original AsyncVectorEnv")
+                        help="Barrier-free rollout collection (all algorithms); off = original AsyncVectorEnv")
     parser.add_argument("--eval-workers", type=int, default=1,
                         help="Processes for evaluation episodes (1 = original sequential evaluation in the main process)")
     parser.add_argument("--eval-episodes", type=int, default=3,

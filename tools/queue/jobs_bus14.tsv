@@ -22,5 +22,5 @@ SAC_T_V	2	--action-type topology --alg SAC --async-collect True --total-timestep
 SAC_T_I	2	--action-type topology --alg SAC --async-collect True --use-heuristic True --heuristic-type idle --total-timesteps 500000 --eval-freq 25000 --train-freq 50 --eval-episodes 10 --eval-workers 10
 SAC_T_R	2	--action-type topology --alg SAC --async-collect True --use-heuristic True --heuristic-type reconnect --total-timesteps 500000 --eval-freq 25000 --train-freq 50 --eval-episodes 10 --eval-workers 10
 SAC_R	2	--action-type redispatch --alg SAC --async-collect True --total-timesteps 5000000 --eval-freq 50000 --train-freq 50 --eval-episodes 10 --eval-workers 10
-#HOLD-async LAGRPPO_C1	2	--action-type topology --alg LAGRPPO --constraints-type 1 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10 --eval-workers 10
-#HOLD-async LAGRPPO_C2	2	--action-type topology --alg LAGRPPO --constraints-type 2 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10 --eval-workers 10
+LAGRPPO_C1	2	--action-type topology --alg LAGRPPO --async-collect True --constraints-type 1 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10 --eval-workers 10
+LAGRPPO_C2	2	--action-type topology --alg LAGRPPO --async-collect True --constraints-type 2 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10 --eval-workers 10

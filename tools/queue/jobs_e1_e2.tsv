@@ -5,3 +5,5 @@
 E1_LAGRPPO_C1_LAM0	2	--action-type topology --alg LAGRPPO --async-collect True --constraints-type 1 --cost-threshold 50 --lag-lr 0 --lag-mul -20 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10 --eval-workers 10
 E2_LAGRPPO_C1	2	--action-type topology --alg LAGRPPO --async-collect True --constraints-type 1 --cost-threshold 50 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10 --eval-workers 10
 E2_LAGRPPO_C2	2	--action-type topology --alg LAGRPPO --async-collect True --constraints-type 2 --cost-threshold 0 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10 --eval-workers 10
+# E1B: O6 control — same disabled constraint (nu~=0) with PPO_T_V hyperparameters & network sizes (fills Wave 2 spare slots).
+E1B_LAGRPPO_C1_PPOCFG	2	--action-type topology --alg LAGRPPO --async-collect True --constraints-type 1 --cost-threshold 50 --lag-lr 0 --lag-mul -20 --actor-lr 3e-5 --update-epochs 40 --n-steps 400 --actor-layers 256 128 64 --critic-layers 512 256 128 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10 --eval-workers 10

@@ -85,9 +85,12 @@ class LagrPPO:
         start_time = start_time
         next_obs, _ = envs.reset()
         next_obs = th.tensor(next_obs).to(device)
+        ep_cost_acc = np.zeros(args.n_envs, dtype=np.float64)
+        ep_len_acc = np.zeros(args.n_envs, dtype=np.int64)
 
         try:
             for iteration in range(init_rollout, n_rollouts + 1):
+                finished_ep_costs, finished_ep_lens = [], []
                 # Annealing the rate if instructed to do so
                 if args.anneal_lr:
                     frac = 1.0 - (iteration - 1.0) / n_rollouts
@@ -99,6 +102,15 @@ class LagrPPO:
                     t_roll = time()
                     seg = envs.collect(agent, batch_size, device, with_cost=True)
                     prev_step, global_step = global_step, global_step + batch_size
+                    for i in range(args.n_envs):
+                        for c_t, d_t in zip(seg["costs"][i], seg["dones"][i]):
+                            ep_cost_acc[i] += c_t
+                            ep_len_acc[i] += 1
+                            if d_t:
+                                finished_ep_costs.append(ep_cost_acc[i])
+                                finished_ep_lens.append(ep_len_acc[i])
+                                ep_cost_acc[i] = 0.0
+                                ep_len_acc[i] = 0
                     # The policy is fixed within a rollout: one eval per crossed eval_freq boundary
                     if global_step // args.eval_freq > prev_step // args.eval_freq:
                         evaluator.evaluate(global_step, agent)
@@ -108,12 +120,15 @@ class LagrPPO:
 
                     # Lagrangian update: same statistic as the synchronous path, whose costs[-8000/n_envs:, :]
                     # is the summed cost of the last 8000/n_envs steps of every env -> here, of every worker segment
+                    lag_before = float(lag_mul.item())
                     k = int(8000 / args.n_envs)
                     costs_q_sum = float(sum(sum(c[-k:]) for c in seg["costs"]))
-                    lag_loss = -lag_mul * (th.tensor(costs_q_sum, dtype=th.float32) - args.cost_threshold)
+                    lag_loss = -lag_mul * (th.tensor(costs_q_sum, dtype=th.float32, device=device) - args.cost_threshold)
                     lag_optim.zero_grad()
                     lag_loss.backward()
                     lag_optim.step()
+                    lag_after = float(lag_mul.item())
+                    nu_val = float(softplus(lag_mul).item())
 
                     with th.no_grad():
                         batch = compute_segment_gae(seg, args.gamma, args.gae_lambda, device, with_cost=True)
@@ -156,13 +171,29 @@ class LagrPPO:
                             evaluator.evaluate(global_step, agent)
                             if args.verbose: print(f"SPS={int(global_step / (time() - start_time))}")
 
+                    costs_np = costs.detach().cpu().numpy()
+                    dones_np = dones.detach().cpu().numpy()
+                    for step_idx in range(args.n_steps):
+                        ep_cost_acc += costs_np[step_idx]
+                        ep_len_acc += 1
+                        done_mask = dones_np[step_idx].astype(bool)
+                        if done_mask.any():
+                            finished_ep_costs.extend(ep_cost_acc[done_mask].tolist())
+                            finished_ep_lens.extend(ep_len_acc[done_mask].tolist())
+                            ep_cost_acc[done_mask] = 0.0
+                            ep_len_acc[done_mask] = 0
+
                     # Lagrangian update
+                    lag_before = float(lag_mul.item())
                     costs_q = costs[-int(8000/args.n_envs):, :].flatten()
-                    lag_loss = -lag_mul * (th.mean(th.tensor(costs_q.sum(), dtype=th.float32)) - args.cost_threshold)
+                    costs_q_sum = float(costs_q.sum().item())
+                    lag_loss = -lag_mul * (th.tensor(costs_q_sum, dtype=th.float32, device=device) - args.cost_threshold)
 
                     lag_optim.zero_grad()
                     lag_loss.backward()
                     lag_optim.step()
+                    lag_after = float(lag_mul.item())
+                    nu_val = float(softplus(lag_mul).item())
 
                     # Bootstrap value if not done
                     with th.no_grad():
@@ -222,6 +253,7 @@ class LagrPPO:
                         pg_loss1 = -mb_advantages * ratio
                         pg_loss2 = -mb_advantages * th.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                         pg_loss = th.max(pg_loss1, pg_loss2).mean()
+                        pg_r_loss = pg_loss
 
                         # Cost component
                         surr_cost_advantage = (mb_cost_advantages * ratio).mean()
@@ -279,6 +311,20 @@ class LagrPPO:
 
                     if args.target_kl is not None and approx_kl > args.target_kl:
                         break
+
+                if args.verbose:
+                    n_ep = len(finished_ep_costs)
+                    ep_cost_mean = float(np.mean(finished_ep_costs)) if n_ep else float("nan")
+                    ep_len_mean = float(np.mean(finished_ep_lens)) if n_ep else float("nan")
+                    print(
+                        f"LagrRollout iter={iteration} step={global_step} "
+                        f"J_c={costs_q_sum:.2f} thresh={args.cost_threshold:.1f} "
+                        f"lag_before={lag_before:.4f} lag={lag_after:.4f} nu={nu_val:.4f} "
+                        f"n_ep={n_ep} ep_cost={ep_cost_mean:.3f} ep_len={ep_len_mean:.1f} "
+                        f"kl={float(approx_kl.item()):.5f} clipfrac={float(np.mean(clipfracs)):.4f} "
+                        f"pg_r={float(pg_r_loss.item()):.4f} surr_c={float(surr_cost_advantage.item()):.4f} "
+                        f"ent={float(entropy_loss.item()):.4f}"
+                    )
 
                 # If we reach the node's time limit, we just exit the training loop, save metrics and ckpt
                 if (time() - start_time) / 60 >= args.time_limit:

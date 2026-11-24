@@ -158,13 +158,15 @@ class Job:
         return f"{alg}_bus14_{kind}_{seed}_0_{heur}_{idle}_{cons}_"
 
     def claim(self, claimed: set, since: float) -> None:
-        cands = sorted((p for p in CKPT_DIR.glob(self.ckpt_prefix() + "*.tar")
-                        if p.stem not in claimed and p.stat().st_mtime >= since),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
-        if cands:
-            (self.dir / "run_name").write_text(cands[0].stem)
-            claimed.add(cands[0].stem)
-            log(f"CLAIM {self.id} -> {cands[0].stem}")
+        for pattern in (f"{self.id}__*.tar", self.ckpt_prefix() + "*.tar"):
+            cands = sorted((p for p in CKPT_DIR.glob(pattern)
+                            if p.stem not in claimed and p.stat().st_mtime >= since),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+            if cands:
+                (self.dir / "run_name").write_text(cands[0].stem)
+                claimed.add(cands[0].stem)
+                log(f"CLAIM {self.id} -> {cands[0].stem}")
+                return
 
     def recover(self, claimed: set) -> None:
         """Queue restarted after its first segment was interrupted before the checkpoint was claimed."""

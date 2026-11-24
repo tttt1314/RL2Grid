@@ -1,0 +1,7 @@
+# E1 & E2 diagnostic experiments (research_directions_rl2grid.md §6), bus14 difficulty 0, branch dev/fixed-async.
+# Usage on VM (put in ~/queue/queue_args): --jobs tools/queue/jobs_e1_e2.tsv --seeds 0
+# E1: LagrPPO C1 hyperparameters with constraint disabled (lag_lr=0, lag_mul=-20 -> nu=softplus(-20)~=2e-9).
+# E2: LagrPPO C1 (thresh=50) and C2 (thresh=0) with per-rollout logging of lambda, nu, J_c, ep_cost, ep_len, kl.
+E1_LAGRPPO_C1_LAM0	2	--action-type topology --alg LAGRPPO --async-collect True --constraints-type 1 --cost-threshold 50 --lag-lr 0 --lag-mul -20 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10 --eval-workers 10
+E2_LAGRPPO_C1	2	--action-type topology --alg LAGRPPO --async-collect True --constraints-type 1 --cost-threshold 50 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10 --eval-workers 10
+E2_LAGRPPO_C2	2	--action-type topology --alg LAGRPPO --async-collect True --constraints-type 2 --cost-threshold 0 --total-timesteps 3000000 --eval-freq 100000 --eval-episodes 10 --eval-workers 10

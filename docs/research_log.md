@@ -133,3 +133,15 @@
 - **文件更新與數據更正：**
   - 同步更新 [research_directions_rl2grid.md](research_directions_rl2grid.md) 與 [reproduction_bus14_seed0.md](reproduction_bus14_seed0.md)，補齊全部 14 組基準的「訓練中最好存活率」並嵌入兩張圖表，同時寫入上述更正與下一步實驗規劃。
   - **更正對象：** 先前於 `reproduction_bus14_seed0.md` 與 `research_directions_rl2grid.md` 註記離散 `SAC` 原版訓練中最好值為 `0.22 @ 1.5M`，重新解析完整 `SAC_T_V_s0` log 後，實際峰值應為 **`0.3546 @ 250k`**（150 萬步時仍約 `0.2517`，之後才逐漸崩潰至 `0.01`）。
+
+### 2026-11-25 20:49 UTC+8 · 完成非 RL 基準、泛化切分與 LagrPPO 演算法升級之本機實作與驗證
+- **實作範圍（依上機預計耗時由快到慢排定，尚未啟動 GCP VM）：**
+  1. **非 RL 傳統基準平行評估工具（`tools/eval_baselines.py`）：** 在與 RL2Grid 完全相同的電網設定下，平行評估不做動作（Idle）、內建自動重連斷線（RecoPowerlineAgent），以及基於 DC 潮流近似的混合整數規劃最佳化代理（MILP／OptimCVXPY；若環境未安裝對應套件則明確提示安裝方式而不中斷其餘基準），同步回報平均存活率、95% 信賴區間、失敗率與過載斷線違規數。
+  2. **嚴格情境切分、觀測統計量保存與獨立評估工具：**
+     - 在 `env/config.py` 與 `env/utils.py` 加入確定性資料切分選項 `--chronics-split` 與 `--eval-chronics-split`（依固定 seed 將 1,004 個情境切為 70% 訓練＝702 個、15% 驗證＝150 個、15% 測試＝152 個，彼此互斥）。
+     - 在 `common/checkpoint.py` 與所有 5 個演算法（`PPO`、`LagrPPO`、`DQN`、`SAC`、`TD3`）加上觀測值正規化統計量 `obs_rms` 的隨檔存取，並搭配 `tools/eval_checkpoint.py` 支援對任意新舊 checkpoint（舊檔自動暖機重建 `obs_rms`）在未見過的測試情境上量測真實泛化表現。
+     - 同步建立嚴格切分重訓排程檔 `tools/queue/jobs_e3_split.tsv`（於訓練集訓練無約束 `PPO` 原版 500 萬步與 Idle 啟發式 50 萬步、驗證集評估、最後測測試集）。
+  3. **修正 `LagrPPO` 失效機制與建立新實驗排程（`tools/queue/jobs_next.tsv`）：**
+     - **信任區間保護消融（`E6A_C1_O5FIX`、`E6A_C2_O5FIX`）：** 新增 `--norm-cost-adv`（將成本優勢函數除以標準差）與 `--clip-cost-surr`（對成本項做悲觀對稱的 PPO 比率裁切），搭配 `--target-kl 0.02` 早停，單獨驗證是否能消除先前 `approx_kl` 暴衝。
+     - **PID 拉格朗日控制與合理化電網 CMDP（`E6B_C1_PID_RD1`、`E6B_C2_PID_RD1`）：** 新增 PID 雙變數更新（`--lag-update-mode pid`）解決 Adam 動量「前衝後鎖」與 `softplus(0) ≈ 0.693` 下限問題；於 `env/cmdp.py` 加入提早停電吸收懲罰 `--fail-absorbing-cost`（消除提早結束躲避過載的漏洞）；於 `common/async_collector.py` 與 `LagrPPO` 支援獨立成本折扣 `--cost-gamma`（預設測試 `0.99`，拉長視野至約 100 步）、以完整情境平均失敗率或平均成本率對齊門檻的 `--dual-stat`（`episode_mean` / `cost_rate`），以及保留斷線獎勵懲罰的 `--keep-disc-penalty`。
+- **本機驗證：** 全部 13 個新增與修改的 Python 檔案皆通過語法編譯檢查（`py_compile`）；8 項單元測試（不依賴 `grid2op` 套件的本機模擬驗證）全數通過，包含 70/15/15 互斥切分、獨立成本折扣 `compute_segment_gae` 數值對拍、提早失敗吸收懲罰單調性、悲觀裁切與標準化、PID 歸零特性、`obs_rms` 存讀往返，以及兩個新排程檔與繪圖解析器的參數相容性。

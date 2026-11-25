@@ -80,17 +80,36 @@ class LagrPPO:
             f"Invalid eval frequency: {args.eval_freq}. Must be multiple of n_envs {args.n_envs}"
         logger = ConstrainedLogger(run_name, args) if args.track else None
         evaluator = CMDPEvaluator(args, logger, device, envs)
+        max_steps = float(evaluator.max_steps)
+
+        cost_gamma = getattr(args, "cost_gamma", -1.0)
+        cost_gamma = args.gamma if cost_gamma < 0 else cost_gamma
+        fail_abs = getattr(args, "fail_absorbing_cost", 0.0)
+        dual_stat = getattr(args, "dual_stat", "window8k")
+        lag_mode = getattr(args, "lag_update_mode", "adam")
+
+        pid_i = 0.0
+        pid_prev_jc = None
+        pid_nu = max(0.0, float(args.lag_mul))
+        if ckpt.resumed and "pid_state" in ckpt.loaded_run:
+            ps = ckpt.loaded_run["pid_state"]
+            pid_i = float(ps.get("pid_i", 0.0))
+            pid_prev_jc = ps.get("pid_prev_jc", None)
+            pid_nu = float(ps.get("pid_nu", pid_nu))
 
         global_step = 0 if not ckpt.resumed else ckpt.loaded_run['global_step']
         start_time = start_time
+        ckpt.restore_obs_rms(envs, args)
         next_obs, _ = envs.reset()
         next_obs = th.tensor(next_obs).to(device)
         ep_cost_acc = np.zeros(args.n_envs, dtype=np.float64)
+        ep_raw_cost_acc = np.zeros(args.n_envs, dtype=np.float64)
         ep_len_acc = np.zeros(args.n_envs, dtype=np.int64)
+        raw_costs = np.zeros((args.n_steps, args.n_envs), dtype=np.float64)
 
         try:
             for iteration in range(init_rollout, n_rollouts + 1):
-                finished_ep_costs, finished_ep_lens = [], []
+                finished_ep_costs, finished_ep_raw_costs, finished_ep_rates, finished_ep_lens = [], [], [], []
                 # Annealing the rate if instructed to do so
                 if args.anneal_lr:
                     frac = 1.0 - (iteration - 1.0) / n_rollouts
@@ -102,14 +121,21 @@ class LagrPPO:
                     t_roll = time()
                     seg = envs.collect(agent, batch_size, device, with_cost=True)
                     prev_step, global_step = global_step, global_step + batch_size
+                    raw_seg = seg.get("raw_costs", seg["costs"])
                     for i in range(args.n_envs):
-                        for c_t, d_t in zip(seg["costs"][i], seg["dones"][i]):
+                        for c_t, rc_t, d_t in zip(seg["costs"][i], raw_seg[i], seg["dones"][i]):
                             ep_cost_acc[i] += c_t
+                            ep_raw_cost_acc[i] += rc_t
                             ep_len_acc[i] += 1
                             if d_t:
+                                ep_len = int(ep_len_acc[i])
+                                raw_c = float(ep_raw_cost_acc[i])
                                 finished_ep_costs.append(ep_cost_acc[i])
-                                finished_ep_lens.append(ep_len_acc[i])
+                                finished_ep_raw_costs.append(raw_c)
+                                finished_ep_rates.append((raw_c + max(0.0, max_steps - ep_len) * fail_abs) / max_steps)
+                                finished_ep_lens.append(ep_len)
                                 ep_cost_acc[i] = 0.0
+                                ep_raw_cost_acc[i] = 0.0
                                 ep_len_acc[i] = 0
                     # The policy is fixed within a rollout: one eval per crossed eval_freq boundary
                     if global_step // args.eval_freq > prev_step // args.eval_freq:
@@ -118,20 +144,11 @@ class LagrPPO:
                             print(f"SPS={int(global_step / (time() - start_time))} "
                                   f"rollout_s={time() - t_roll:.1f} waits={seg['n_waits']}")
 
-                    # Lagrangian update: same statistic as the synchronous path, whose costs[-8000/n_envs:, :]
-                    # is the summed cost of the last 8000/n_envs steps of every env -> here, of every worker segment
-                    lag_before = float(lag_mul.item())
                     k = int(8000 / args.n_envs)
                     costs_q_sum = float(sum(sum(c[-k:]) for c in seg["costs"]))
-                    lag_loss = -lag_mul * (th.tensor(costs_q_sum, dtype=th.float32, device=device) - args.cost_threshold)
-                    lag_optim.zero_grad()
-                    lag_loss.backward()
-                    lag_optim.step()
-                    lag_after = float(lag_mul.item())
-                    nu_val = float(softplus(lag_mul).item())
-
                     with th.no_grad():
-                        batch = compute_segment_gae(seg, args.gamma, args.gae_lambda, device, with_cost=True)
+                        batch = compute_segment_gae(seg, args.gamma, args.gae_lambda, device,
+                                                    with_cost=True, cost_gamma=cost_gamma)
                     b_obs, b_logprobs, b_actions = batch["obs"], batch["logprobs"], batch["actions"]
                     b_advantages, b_returns, b_values = batch["advantages"], batch["returns"], batch["values"]
                     b_cost_advantages, b_cost_returns = batch["cost_advantages"], batch["cost_returns"]
@@ -157,13 +174,17 @@ class LagrPPO:
                         terminations[step] = th.tensor(next_terminations).to(device)
 
                         real_next_obs = next_obs.copy()
-                        cost = infos.get('cost', np.zeros(args.n_envs))
+                        cost = np.array(infos.get('cost', np.zeros(args.n_envs)), dtype=np.float64, copy=True)
+                        raw_cost = np.array(infos.get('raw_cost', cost), dtype=np.float64, copy=True)
                         for idx, done in enumerate(dones[step]):
                             if done: 
                                 real_next_obs[idx] = infos["final_observation"][idx]
-                                cost[idx] =  infos["final_info"][idx]['cost']   # When done, 'cost' is also in 'final_info'
+                                fi = infos["final_info"][idx]
+                                cost[idx] = fi['cost']   # When done, 'cost' is also in 'final_info'
+                                raw_cost[idx] = fi.get('raw_cost', fi['cost'])
     
                         costs[step] = th.tensor(cost).to(device).view(-1)
+                        raw_costs[step] = raw_cost
                         next_obs = th.tensor(next_obs).to(device)
                         real_next_obs = th.tensor(real_next_obs).to(device)
 
@@ -175,25 +196,23 @@ class LagrPPO:
                     dones_np = dones.detach().cpu().numpy()
                     for step_idx in range(args.n_steps):
                         ep_cost_acc += costs_np[step_idx]
+                        ep_raw_cost_acc += raw_costs[step_idx]
                         ep_len_acc += 1
                         done_mask = dones_np[step_idx].astype(bool)
                         if done_mask.any():
-                            finished_ep_costs.extend(ep_cost_acc[done_mask].tolist())
-                            finished_ep_lens.extend(ep_len_acc[done_mask].tolist())
+                            for idx in np.where(done_mask)[0]:
+                                ep_len = int(ep_len_acc[idx])
+                                raw_c = float(ep_raw_cost_acc[idx])
+                                finished_ep_costs.append(float(ep_cost_acc[idx]))
+                                finished_ep_raw_costs.append(raw_c)
+                                finished_ep_rates.append((raw_c + max(0.0, max_steps - ep_len) * fail_abs) / max_steps)
+                                finished_ep_lens.append(ep_len)
                             ep_cost_acc[done_mask] = 0.0
+                            ep_raw_cost_acc[done_mask] = 0.0
                             ep_len_acc[done_mask] = 0
 
-                    # Lagrangian update
-                    lag_before = float(lag_mul.item())
                     costs_q = costs[-int(8000/args.n_envs):, :].flatten()
                     costs_q_sum = float(costs_q.sum().item())
-                    lag_loss = -lag_mul * (th.tensor(costs_q_sum, dtype=th.float32, device=device) - args.cost_threshold)
-
-                    lag_optim.zero_grad()
-                    lag_loss.backward()
-                    lag_optim.step()
-                    lag_after = float(lag_mul.item())
-                    nu_val = float(softplus(lag_mul).item())
 
                     # Bootstrap value if not done
                     with th.no_grad():
@@ -209,8 +228,8 @@ class LagrPPO:
                                 nextcostvalues = cost_values[t + 1]
                             delta = rewards[t] + args.gamma * nextvalues * (1 - terminations[t]) - values[t]
                             advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * (1 - dones[t]) * lastgaelam
-                            cost_delta = costs[t] + args.gamma * nextcostvalues * (1 - terminations[t]) - cost_values[t]
-                            cost_advantages[t] = lastcostgaelam = cost_delta + args.gamma * args.gae_lambda * (1 - dones[t]) * lastcostgaelam
+                            cost_delta = costs[t] + cost_gamma * nextcostvalues * (1 - terminations[t]) - cost_values[t]
+                            cost_advantages[t] = lastcostgaelam = cost_delta + cost_gamma * args.gae_lambda * (1 - dones[t]) * lastcostgaelam
                         returns = advantages + values
                         cost_returns = cost_advantages + cost_values
    
@@ -225,10 +244,43 @@ class LagrPPO:
                     b_values = values.reshape(-1)
                     b_cost_values = cost_values.reshape(-1)
 
+                # Dual statistic and multiplier update (shared between async and sync paths)
+                if dual_stat == "window8k":
+                    dual_jc = costs_q_sum
+                elif dual_stat == "episode_mean":
+                    dual_jc = float(np.mean(finished_ep_raw_costs)) if finished_ep_raw_costs else float(np.mean(ep_raw_cost_acc))
+                else:  # "cost_rate"
+                    if finished_ep_rates:
+                        dual_jc = float(np.mean(finished_ep_rates))
+                    else:
+                        dual_jc = float(np.mean((ep_raw_cost_acc + np.maximum(0.0, max_steps - ep_len_acc) * fail_abs) / max_steps))
+
+                if lag_mode == "pid":
+                    lag_before = pid_nu
+                    err = dual_jc - args.cost_threshold
+                    pid_i = max(0.0, pid_i + err)
+                    pid_d = 0.0 if pid_prev_jc is None else max(0.0, dual_jc - pid_prev_jc)
+                    pid_prev_jc = dual_jc
+                    pid_nu = max(0.0, min(args.lag_max, args.lag_kp * err + args.lag_ki * pid_i + args.lag_kd * pid_d))
+                    lag_after = pid_nu
+                    nu_val = pid_nu
+                    multiplier = th.tensor(pid_nu, dtype=th.float32, device=device)
+                else:
+                    lag_before = float(lag_mul.item())
+                    lag_loss = -lag_mul * (th.tensor(dual_jc, dtype=th.float32, device=device) - args.cost_threshold)
+                    lag_optim.zero_grad()
+                    lag_loss.backward()
+                    lag_optim.step()
+                    lag_after = float(lag_mul.item())
+                    nu_val = float(softplus(lag_mul).item())
+                    multiplier = softplus(lag_mul).detach()
+
                 # Optimizing the policy and value network
                 b_inds = np.arange(batch_size)
                 clipfracs = []
+                epochs_run = 0
                 for _ in range(args.update_epochs):
+                    epochs_run += 1
                     np.random.shuffle(b_inds)
                     for start in range(0, batch_size, minibatch_size):
                         end = start + minibatch_size
@@ -247,7 +299,10 @@ class LagrPPO:
                         mb_cost_advantages = b_cost_advantages[mb_inds]
                         if args.norm_adv:
                             mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-                            mb_cost_advantages -= mb_cost_advantages.mean()
+                            if getattr(args, "norm_cost_adv", False):
+                                mb_cost_advantages = (mb_cost_advantages - mb_cost_advantages.mean()) / (mb_cost_advantages.std() + 1e-8)
+                            else:
+                                mb_cost_advantages -= mb_cost_advantages.mean()
 
                         # Policy loss
                         pg_loss1 = -mb_advantages * ratio
@@ -256,8 +311,12 @@ class LagrPPO:
                         pg_r_loss = pg_loss
 
                         # Cost component
-                        surr_cost_advantage = (mb_cost_advantages * ratio).mean()
-                        multiplier = softplus(lag_mul).detach()
+                        if getattr(args, "clip_cost_surr", False):
+                            c_loss1 = mb_cost_advantages * ratio
+                            c_loss2 = mb_cost_advantages * th.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                            surr_cost_advantage = th.max(c_loss1, c_loss2).mean()
+                        else:
+                            surr_cost_advantage = (mb_cost_advantages * ratio).mean()
 
                         pg_loss = (pg_loss + multiplier * surr_cost_advantage) / (1 + multiplier)
 
@@ -315,15 +374,18 @@ class LagrPPO:
                 if args.verbose:
                     n_ep = len(finished_ep_costs)
                     ep_cost_mean = float(np.mean(finished_ep_costs)) if n_ep else float("nan")
+                    ep_raw_cost_mean = float(np.mean(finished_ep_raw_costs)) if n_ep else float("nan")
+                    ep_rate_mean = float(np.mean(finished_ep_rates)) if n_ep else float("nan")
                     ep_len_mean = float(np.mean(finished_ep_lens)) if n_ep else float("nan")
                     print(
                         f"LagrRollout iter={iteration} step={global_step} "
-                        f"J_c={costs_q_sum:.2f} thresh={args.cost_threshold:.1f} "
+                        f"J_c={dual_jc:.4f} thresh={args.cost_threshold:.4f} "
                         f"lag_before={lag_before:.4f} lag={lag_after:.4f} nu={nu_val:.4f} "
                         f"n_ep={n_ep} ep_cost={ep_cost_mean:.3f} ep_len={ep_len_mean:.1f} "
                         f"kl={float(approx_kl.item()):.5f} clipfrac={float(np.mean(clipfracs)):.4f} "
                         f"pg_r={float(pg_r_loss.item()):.4f} surr_c={float(surr_cost_advantage.item()):.4f} "
-                        f"ent={float(entropy_loss.item()):.4f}"
+                        f"ent={float(entropy_loss.item()):.4f} "
+                        f"ep_raw_cost={ep_raw_cost_mean:.3f} ep_rate={ep_rate_mean:.4f} epochs={epochs_run}"
                     )
 
                 # If we reach the node's time limit, we just exit the training loop, save metrics and ckpt
@@ -332,7 +394,9 @@ class LagrPPO:
 
         finally:
             # Save the checkpoint and logger data
-            ckpt.set_record(args, agent.actor, agent.critic, agent.cost_critic, global_step, actor_optim, critic_optim, cost_critic_optim, cost_threshold, lag_mul, lag_optim, "" if not logger else logger.wb_path, iteration)
+            pid_state = {"pid_i": pid_i, "pid_prev_jc": pid_prev_jc, "pid_nu": pid_nu}
+            ckpt.set_record(args, agent.actor, agent.critic, agent.cost_critic, global_step, actor_optim, critic_optim, cost_critic_optim, cost_threshold, lag_mul, lag_optim, "" if not logger else logger.wb_path, iteration, pid_state=pid_state)
+            ckpt.save_obs_rms(envs, args)
             ckpt.save()
             if logger: logger.close()
             envs.close()

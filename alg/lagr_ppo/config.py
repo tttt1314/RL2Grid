@@ -38,5 +38,17 @@ def get_alg_args() -> Namespace:
     parser.add_argument("--cost-threshold", type=float, default=15.0, help="Cost threshold")
     parser.add_argument("--lag-mul", type=float, default=1., help="Initial value for the multiplier")
     parser.add_argument("--lag-lr", type=float, default=0.05, help="Learning rate for the multiplier")
+    parser.add_argument("--norm-cost-adv", type=str2bool, default=False,
+                        help="Divide cost advantages by std (+1e-8) like reward advantages (O5 fix)")
+    parser.add_argument("--clip-cost-surr", type=str2bool, default=False,
+                        help="Apply pessimistic PPO ratio clipping to the cost surrogate (O5 fix)")
+    parser.add_argument("--lag-update-mode", type=str, default="adam", choices=["adam", "pid"],
+                        help="Dual multiplier update rule: original Adam or PID Lagrangian (RD2)")
+    parser.add_argument("--lag-kp", type=float, default=0.05, help="PID proportional gain")
+    parser.add_argument("--lag-ki", type=float, default=0.01, help="PID integral gain")
+    parser.add_argument("--lag-kd", type=float, default=0.01, help="PID derivative gain")
+    parser.add_argument("--lag-max", type=float, default=100.0, help="Upper bound for PID multiplier")
+    parser.add_argument("--dual-stat", type=str, default="window8k", choices=["window8k", "episode_mean", "cost_rate"],
+                        help="Cost statistic compared against --cost-threshold for dual update")
 
     return parser.parse_known_args()[0]

@@ -29,6 +29,16 @@ def get_env_args() -> Namespace:
 
     parser.add_argument("--optimize-mem", type=str2bool, default=True, help="Whether to load data chunks upon resets (True), or the whole dataset once (False)")
     parser.add_argument("--constraints-type", type=int, default=0, choices=[0, 1, 2], help="Select the type of constraints to use: no constraints (0), failure constraints (1), overloads constraints (2)")
+    parser.add_argument("--chronics-split", type=str, default="all", choices=["all", "train", "val", "test"],
+                        help="Deterministic chronics split for training/eval (all=original, train=70%, val=15%, test=15%)")
+    parser.add_argument("--eval-chronics-split", type=str, default="", choices=["", "all", "train", "val", "test"],
+                        help="Optional chronics split override for evaluation environments (empty=same as --chronics-split)")
+    parser.add_argument("--keep-disc-penalty", type=str2bool, default=False,
+                        help="Keep OverloadReward disconnection penalty (-1.0) even when constraints-type != 0")
+    parser.add_argument("--fail-absorbing-cost", type=float, default=0.0,
+                        help="Per-step absorbing cost c_max charged for remaining horizon on premature failure (TLO/RD1)")
+    parser.add_argument("--cost-gamma", type=float, default=-1.0,
+                        help="Independent discount factor for CMDP cost critic and absorbing terminal cost (<0 uses --gamma)")
 
     # Parse the arguments
     params, _ = parser.parse_known_args()

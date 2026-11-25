@@ -76,6 +76,7 @@ class DQN:
         # before training again (as on a fresh start) instead of sampling a buffer of a few dozen rows.
         train_from_step = args.learning_starts if not ckpt.resumed else global_step + args.learning_starts
         start_time = start_time
+        ckpt.restore_obs_rms(envs, args)
         obs, _ = envs.reset(seed=args.seed)
 
         try:
@@ -143,6 +144,7 @@ class DQN:
         finally:
             # Save the checkpoint and logger data
             ckpt.set_record(args, qnet, global_step, qnet_optim, "" if not logger else logger.wb_path, step)
+            ckpt.save_obs_rms(envs, args)
             ckpt.save()
             if logger: logger.close()
             envs.close()

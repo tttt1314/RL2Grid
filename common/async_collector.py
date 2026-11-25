@@ -23,8 +23,9 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import traceback
+from copy import deepcopy
 from multiprocessing.connection import wait
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import torch as th
@@ -44,7 +45,8 @@ def _worker(remote, parent_remote, env_fn: Callable) -> None:
                     final_obs = obs
                     obs, _ = env.reset()
                 cost = float(info.get("cost", 0.0))  # CMDP wrappers only; taken before the autoreset
-                remote.send(("ok", (obs, float(reward), bool(terminated), bool(truncated), final_obs, cost)))
+                raw_cost = float(info.get("raw_cost", cost))
+                remote.send(("ok", (obs, float(reward), bool(terminated), bool(truncated), final_obs, cost, raw_cost)))
             elif cmd == "reset":
                 obs, _ = env.reset(seed=data)
                 remote.send(("ok", obs))
@@ -52,6 +54,10 @@ def _worker(remote, parent_remote, env_fn: Callable) -> None:
                 remote.send(("ok", (env.observation_space, env.action_space)))
             elif cmd == "get_attr":
                 remote.send(("ok", getattr(env, data)))
+            elif cmd == "set_attr":
+                name, val = data
+                setattr(env, name, val)
+                remote.send(("ok", None))
             elif cmd == "close":
                 break
     except (KeyboardInterrupt, EOFError):
@@ -113,7 +119,7 @@ class AsyncCollector:
     def _drain_pending(self) -> None:
         """Finish in-flight off-policy steps (kept for the next collect) so the pipes are idle."""
         for i in list(getattr(self, "_pending", {})):
-            next_obs, reward, terminated, truncated, final_obs, _ = self._recv(i)
+            next_obs, reward, terminated, truncated, final_obs, _, _ = self._recv(i)
             obs, action = self._pending.pop(i)
             real_next = final_obs if final_obs is not None else next_obs
             self._carry.append((obs, real_next, action, reward, terminated))
@@ -123,6 +129,16 @@ class AsyncCollector:
         """Same contract as gymnasium's VectorEnv.get_attr (e.g. obs_rms for the evaluator)."""
         self._drain_pending()  # a pending step reply would otherwise be read as the attribute
         return [self._call(i, "get_attr", name) for i in range(self.num_envs)]
+
+    def set_attr(self, name: str, values) -> None:
+        """Mirror VectorEnv.set_attr (accepts a per-worker sequence or a single value to broadcast)."""
+        self._drain_pending()
+        if isinstance(values, (list, tuple)) and len(values) == self.num_envs:
+            for i in range(self.num_envs):
+                self._call(i, "set_attr", (name, deepcopy(values[i])))
+        else:
+            for i in range(self.num_envs):
+                self._call(i, "set_attr", (name, deepcopy(values)))
 
     def close(self) -> None:
         for r in self.remotes:
@@ -148,7 +164,7 @@ class AsyncCollector:
             self.reset()
         n = self.num_envs
         seg = {k: [[] for _ in range(n)] for k in ("obs", "actions", "logprobs", "values", "rewards",
-                                                    "terminations", "dones", "costs", "cost_values")}
+                                                    "terminations", "dones", "costs", "raw_costs", "cost_values")}
         ready = list(range(n))
         in_flight = set()
         dispatched = 0
@@ -183,10 +199,11 @@ class AsyncCollector:
             idle_waits += 1
             for conn in conns:
                 i = self.remotes.index(conn)
-                next_obs, reward, terminated, truncated, final_obs, cost = self._recv(i)
+                next_obs, reward, terminated, truncated, final_obs, cost, raw_cost = self._recv(i)
                 in_flight.discard(i)
                 seg["rewards"][i].append(reward)
                 seg["costs"][i].append(cost)
+                seg["raw_costs"][i].append(raw_cost)
                 seg["terminations"][i].append(int(terminated))
                 seg["dones"][i].append(int(terminated or truncated))
                 self.obs[i] = next_obs
@@ -233,7 +250,7 @@ class AsyncCollector:
                     self.remotes[i].send(("step", actions[k]))
             for conn in wait([self.remotes[i] for i in self._pending]):
                 i = self.remotes.index(conn)
-                next_obs, reward, terminated, truncated, final_obs, _ = self._recv(i)
+                next_obs, reward, terminated, truncated, final_obs, _, _ = self._recv(i)
                 obs, action = self._pending.pop(i)
                 real_next = final_obs if final_obs is not None else next_obs
                 out.append((obs, real_next, action, reward, terminated))
@@ -258,15 +275,16 @@ def _gae(values, rewards, terms, dones, bootstrap, gamma: float, gae_lambda: flo
 
 
 def compute_segment_gae(seg: Dict[str, list], gamma: float, gae_lambda: float, device: th.device,
-                        with_cost: bool = False):
+                        with_cost: bool = False, cost_gamma: Optional[float] = None):
     """Per-worker GAE on variable-length segments; returns flat batch tensors.
 
     Uses exactly the same recursion as RL2Grid's synchronous PPO:
         delta_t = r_t + gamma * V_{t+1} * (1 - term_t) - V_t
         A_t     = delta_t + gamma * lambda * (1 - done_t) * A_{t+1}
     where V_{t+1} for the last step of a segment is the value of the worker's current observation.
-    `with_cost` (LagrPPO) runs the same recursion on the costs with the cost critic.
+    `with_cost` (LagrPPO) runs the same recursion on the costs with the cost critic (using `cost_gamma` if given).
     """
+    cg = gamma if cost_gamma is None else cost_gamma
     keys = ["obs", "actions", "logprobs", "values", "advantages", "returns"]
     if with_cost: keys += ["cost_values", "cost_advantages", "cost_returns"]
     out = {k: [] for k in keys}
@@ -287,7 +305,7 @@ def compute_segment_gae(seg: Dict[str, list], gamma: float, gae_lambda: float, d
         if with_cost:
             cvalues = th.stack(seg["cost_values"][i])
             cadv = _gae(cvalues, th.tensor(seg["costs"][i], **f32), terms, dones, seg["cost_bootstrap"][i],
-                        gamma, gae_lambda)
+                        cg, gae_lambda)
             out["cost_values"].append(cvalues)
             out["cost_advantages"].append(cadv)
             out["cost_returns"].append(cadv + cvalues)

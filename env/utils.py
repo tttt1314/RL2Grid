@@ -25,6 +25,26 @@ if version.parse(grid2op.__version__) < MIN_GLOP_VERSION:
                        "You might need to install it from github "
                        "`pip install git+https://github.com/rte-france/grid2op.git@dev_1.10.4`")
 
+def select_chronics_for_split(names: List[str], split: str, seed: int = 42) -> set:
+    """Deterministically partition chronic folder names into 70% train / 15% val / 15% test."""
+    ordered = sorted(set(names))
+    if split == "all":
+        return set(ordered)
+    n = len(ordered)
+    perm = np.random.default_rng(seed).permutation(n)
+    n_train = int(0.70 * n)
+    n_val = int(0.15 * n)
+    if split == "train":
+        idx = perm[:n_train]
+    elif split == "val":
+        idx = perm[n_train : n_train + n_val]
+    elif split == "test":
+        idx = perm[n_train + n_val :]
+    else:
+        raise ValueError(f"Unknown chronics split: {split}")
+    return {ordered[i] for i in idx}
+
+
 def load_config(file_path: str) -> Dict:
     """Load configuration from a JSON file.
 
@@ -97,11 +117,12 @@ def auxiliary_make_env(args: Dict[str, Any], resume_run: bool = False, idx: int 
         
     # Create a grid2op environment with specified backend and reward structure
     # Separate rewards for the eval env for logging
+    constrained_flag = (args.constraints_type != 0) and (not getattr(args, "keep_disc_penalty", False))
     rewards = {}
     if eval_env:
         rewards['redispatchReward'] = RedispRewardv1()
         rewards['lineMarginReward'] = LineMarginReward()
-        rewards['overloadReward'] = OverloadReward(constrained=args.constraints_type != 0)
+        rewards['overloadReward'] = OverloadReward(constrained=constrained_flag)
         if env_type == 'topology': rewards['topologyReward'] = DistanceRewardv1()
     
     if args.n1_reward:
@@ -118,12 +139,19 @@ def auxiliary_make_env(args: Dict[str, Any], resume_run: bool = False, idx: int 
         #class_in_file=True
     ) 
     
-    if args.optimize_mem: g2op_env.chronics_handler.set_chunk_size(100)    # Instead of loading all episode data, get chunks of 100
-    else:
-        # Assign a filter (e.g., use only chronics that have "december" in their name) to reduce memory footprint
-        #env.chronics_handler.real_data.set_filter(lambda x: re.match(".*december.*", x) is not None)
+    split = (getattr(args, "eval_chronics_split", "") if eval_env else "") or getattr(args, "chronics_split", "all")
+    if split != "all":
+        all_names = [os.path.basename(os.path.normpath(str(p))) for p in g2op_env.chronics_handler.real_data.subpaths]
+        allowed = select_chronics_for_split(all_names, split)
+        g2op_env.chronics_handler.real_data.set_filter(
+            lambda x, _a=allowed: os.path.basename(os.path.normpath(str(x))) in _a
+        )
+        g2op_env.chronics_handler.reset()
+    elif not args.optimize_mem:
         # Create the cache; otherwise it'll only load the first scenario
         g2op_env.chronics_handler.reset()
+
+    if args.optimize_mem: g2op_env.chronics_handler.set_chunk_size(100)    # Instead of loading all episode data, get chunks of 100
     
     cr = g2op_env.get_reward_instance()  # Initialize the combined reward instance
     # Per step (cumulative) positive reward for staying alive; reaches 1 at the end of the episode
@@ -135,7 +163,7 @@ def auxiliary_make_env(args: Dict[str, Any], resume_run: bool = False, idx: int 
         #if env_type == 'topology': cr.addReward("TopologyReward", DistanceRewardv1(), 0.3)   # = 0 if topology is the original one, -1 if everything changed
         cr.addReward("redispatchReward", RedispRewardv1(), 0.5)  # Custom one, see common.rewards
         #cr.addReward("LineMarginReward", LineMarginReward(), 0.5)  # Custom one, see common.rewards
-        cr.addReward("overloadReward", OverloadReward(constrained=args.constraints_type != 0), 1.0)  # Custom one, see common.rewards
+        cr.addReward("overloadReward", OverloadReward(constrained=constrained_flag), 1.0)  # Custom one, see common.rewards
 
     cr.initialize(g2op_env)  # Finalize the reward setup
 
@@ -217,10 +245,13 @@ def auxiliary_make_env(args: Dict[str, Any], resume_run: bool = False, idx: int 
     else: gym_env = gym.wrappers.RecordEpisodeStatistics(gym_env)            
 
     # Use (or not) the CMDP versions of the tasks
+    cost_gamma = getattr(args, "cost_gamma", -1.0)
+    cost_gamma = args.gamma if cost_gamma < 0 else cost_gamma
+    fail_abs = getattr(args, "fail_absorbing_cost", 0.0)
     if args.constraints_type == 1:
-        gym_env = ConstrainedFailureGridOp(gym_env)
+        gym_env = ConstrainedFailureGridOp(gym_env, fail_absorbing_cost=fail_abs, cost_gamma=cost_gamma)
     elif args.constraints_type == 2:
-        gym_env = ConstrainedOverloadGridOp(gym_env)
+        gym_env = ConstrainedOverloadGridOp(gym_env, fail_absorbing_cost=fail_abs, cost_gamma=cost_gamma)
 
     if args.norm_obs: gym_env = NormalizeObservation(gym_env)
 

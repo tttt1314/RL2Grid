@@ -68,6 +68,7 @@ class PPO:
 
         global_step = 0 if not ckpt.resumed else ckpt.loaded_run['global_step']
         start_time = start_time
+        ckpt.restore_obs_rms(envs, args)
         next_obs, _ = envs.reset()
         next_obs = th.tensor(next_obs).to(device)
 
@@ -213,6 +214,7 @@ class PPO:
         finally:
             # Save the checkpoint and logger data
             ckpt.set_record(args, agent.actor, agent.critic, global_step, actor_optim, critic_optim, "" if not logger else logger.wb_path, iteration)
+            ckpt.save_obs_rms(envs, args)
             ckpt.save()
             if logger: logger.close()
             envs.close()

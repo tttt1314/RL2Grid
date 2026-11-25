@@ -1,5 +1,6 @@
 import os
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass
 
 from .imports import *
@@ -44,6 +45,27 @@ class CheckpointSaver(ABC):
             'global_step': global_step,
         }
 
+    def save_obs_rms(self, envs, args) -> None:
+        """Store NormalizeObservation running statistics into self.record if enabled."""
+        if not getattr(args, "norm_obs", False):
+            return
+        try:
+            rms_list = envs.get_attr("obs_rms")
+            if rms_list:
+                self.record["obs_rms"] = deepcopy(rms_list[0])
+        except Exception:
+            pass
+
+    def restore_obs_rms(self, envs, args) -> None:
+        """Restore NormalizeObservation running statistics from a resumed checkpoint."""
+        if not (self.resumed and getattr(args, "norm_obs", False) and "obs_rms" in self.loaded_run):
+            return
+        try:
+            n = getattr(envs, "num_envs", getattr(args, "n_envs", 1))
+            envs.set_attr("obs_rms", [deepcopy(self.loaded_run["obs_rms"])] * n)
+        except Exception:
+            pass
+
     def save(self) -> None:
         """Save the current record to a checkpoint file."""
         # Atomic: write a temp file and rename, so an interrupted save never leaves a truncated checkpoint
@@ -87,7 +109,8 @@ class PPOCheckpoint(CheckpointSaver):
 
 class LagrPPOCheckpoint(PPOCheckpoint):
     def set_record(
-        self, args: Dict[str, Any], actor: nn.Sequential, critic: nn.Sequential, cost_critic: nn.Sequential, global_step: int, actor_optim: optim, critic_optim: optim, cost_critic_optim: optim, cost_threshold, lag_mul, lag_optim: optim, wb_run_name: str, last_rollout: int = 0
+        self, args: Dict[str, Any], actor: nn.Sequential, critic: nn.Sequential, cost_critic: nn.Sequential, global_step: int, actor_optim: optim, critic_optim: optim, cost_critic_optim: optim, cost_threshold, lag_mul, lag_optim: optim, wb_run_name: str, last_rollout: int = 0,
+        pid_state: Optional[Dict[str, Any]] = None
     ) -> None:
         """Set the record for PPO checkpoints.
 
@@ -107,6 +130,8 @@ class LagrPPOCheckpoint(PPOCheckpoint):
         self.record['cost_threshold'] = cost_threshold
         self.record['lag_mul'] = lag_mul.tolist()
         self.record['lag_optim'] = lag_optim.state_dict()
+        if pid_state is not None:
+            self.record['pid_state'] = pid_state
 
 class SACCheckpoint(PPOCheckpoint):
     def set_record(

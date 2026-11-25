@@ -1,0 +1,4 @@
+# Batch 2: E3 / RD7 strict 70/15/15 chronics split (train on train, periodic eval on val, final eval on test via tools/eval_checkpoint.py).
+# Usage on VM (~/queue/queue_args): --jobs tools/queue/jobs_e3_split.tsv --seeds 0
+E3_PPO_T_V_SPLIT	2	--action-type topology --alg PPO --async-collect True --chronics-split train --eval-chronics-split val --total-timesteps 5000000 --eval-freq 50000 --eval-episodes 10 --eval-workers 10
+E3_PPO_T_I_SPLIT	2	--action-type topology --alg PPO --async-collect True --use-heuristic True --heuristic-type idle --chronics-split train --eval-chronics-split val --total-timesteps 500000 --eval-freq 25000 --eval-episodes 10 --eval-workers 10

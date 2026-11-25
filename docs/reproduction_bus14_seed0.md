@@ -1,6 +1,6 @@
 # RL2Grid bus14 Reproduction：seed 0 結果與原論文對照
 
-> 狀態（2026-11-20）：seed 0 的 14 個設定全部跑完（SAC_R 5M、LagrPPO C1/C2 各 3M 都已完成）。尚未執行的只有非 RL baseline（Idle、MILP）。
+> 狀態（2026-11-25）：seed 0 的 14 個 RL 設定已全部跑完；非 RL baseline 中「不做動作（Idle）」與「自動重連（Reco）」已各跑完 100 個情境（`tools/eval_baselines.py`），DC 最佳化（MILP）因 VM 未安裝 `grid2op_milp_agent`／`l2rpn_baselines.OptimCVXPY` 而略過。
 > 本文件只有 **1 個 seed**，原論文是 **10 個 runs 的平均**，所以下面的比較只能看趨勢，還不能當作 reproduction 的結論。
 
 ---
@@ -47,7 +47,9 @@ LagrPPO（約束版）在論文中只有訓練曲線（Figure 5 右、Figure G.3
 | SAC V | 5M | 0.17 | **0.01** (0.01–0.02) | 0.35 @ 250k | −0.16 | ⬇ 偏低（後期崩潰，見 §5） |
 | SAC I | 500k | 0.56 | **0.85** (0.79–0.88) | 1.00 @ 50k | +0.29 | ⬆ 明顯較高 |
 | SAC R | 500k | 0.16 | **0.62** (0.59–0.66) | 1.00 @ 250k | +0.46 | ⬆ 明顯較高 |
-| Idle / MILP | — | 0.18 / 0.06 | 尚未執行 | — | — | 待補 |
+| Idle（不做動作，100 ep） | — | 0.18 | **0.24** (0.2394 ± 0.0382，`C1_fail=0.990`、`C2_cost=23.01`) | — | +0.06 | ✅ 與論文趨勢相近（100 ep 抽樣） |
+| Reco（自動重連，100 ep） | — | — | **0.24** (0.2394 ± 0.0382，與 Idle 同值) | — | — | 註：論文 Table 2 未單獨列 Reco |
+| MILP（DC 最佳化） | — | 0.06 | 略過（VM 未安裝套件） | — | — | ⚠️ 缺 `grid2op_milp_agent`／`OptimCVXPY`，維持環境穩定暫不安裝 |
 
 ### Redispatch 動作（對照 Table 3 的 bus14 列）
 
@@ -56,7 +58,7 @@ LagrPPO（約束版）在論文中只有訓練曲線（Figure 5 右、Figure G.3
 | PPO V | 5M | 0.17 | **0.16** (0.10–0.25) | 0.40 @ 1.0M | −0.01 | ✅ 一致 |
 | SAC V | 5M | 0.01 | **0.19** (0.15–0.21) | 0.42 @ 4.6M | +0.18 | ⬆ 較高 |
 | TD3 V | 5M | 0.06 | **0.15** (0.14–0.17) | 0.37 @ 500k | +0.09 | ⬆ 較高 |
-| Idle | — | 0.00 | 尚未執行 | — | — | 待補 |
+| Idle（不做動作，100 ep） | — | 0.00 | **0.24** (0.2394 ± 0.0382，`C1_fail=0.990`、`C2_cost=23.01`) | — | +0.24 | ⚠️ 本實測於兩種動作空間皆得 0.24（與論文 0.00 差異待查） |
 
 ### 約束版（LagrPPO，topology）
 
@@ -149,7 +151,7 @@ LagrPPO（約束版）在論文中只有訓練曲線（Figure 5 右、Figure G.3
 
 - [x] SAC_R 跑完 5M 步
 - [x] LagrPPO C1、C2（非同步收集；門檻為論文的值：LSI 50、TLO 0）
-- [ ] 非 RL baseline：Idle、MILP（Table 2、3 的前幾欄）
+- [x] 非 RL baseline：Idle（拓撲與發電再調度各 100 ep，皆為 `0.2394 ± 0.0382`）與 Reco（`0.2394 ± 0.0382`）已完成量測；MILP 因 VM 未安裝 `grid2op_milp_agent`／`l2rpn_baselines.OptimCVXPY` 而略過（維持訓練用環境穩定暫不安裝）
 - [x] 從完整 log 產生學習曲線，加上「訓練過程中的最好值」欄位（圖表：`figures/bus14_seed0_learning_curves.png`，繪圖腳本：`tools/plot_curves.py`）
 - [ ] 視結果決定是否跑 seed 1、2，以及是否用論文 Table F.1 的超參數重跑差距大的設定（PPO I/R、SAC V）
 

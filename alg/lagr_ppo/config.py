@@ -48,7 +48,10 @@ def get_alg_args() -> Namespace:
     parser.add_argument("--lag-ki", type=float, default=0.01, help="PID integral gain")
     parser.add_argument("--lag-kd", type=float, default=0.01, help="PID derivative gain")
     parser.add_argument("--lag-max", type=float, default=100.0, help="Upper bound for PID multiplier")
-    parser.add_argument("--dual-stat", type=str, default="window8k", choices=["window8k", "episode_mean", "cost_rate"],
-                        help="Cost statistic compared against --cost-threshold for dual update")
+    parser.add_argument("--dual-stat", type=str, default="window8k",
+                        choices=["window8k", "episode_mean", "cost_rate", "step_rate_1k"],
+                        help="Cost statistic compared against --cost-threshold for dual update (step_rate_1k = 1000 * rollout raw_cost sum / rollout steps)")
+    parser.add_argument("--lag-warmup-iters", type=int, default=0,
+                        help="Skip dual multiplier updates for the first N rollouts while keeping nu at initial lag_mul")
 
     return parser.parse_known_args()[0]

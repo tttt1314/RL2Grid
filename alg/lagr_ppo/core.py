@@ -87,6 +87,7 @@ class LagrPPO:
         fail_abs = getattr(args, "fail_absorbing_cost", 0.0)
         dual_stat = getattr(args, "dual_stat", "window8k")
         lag_mode = getattr(args, "lag_update_mode", "adam")
+        lag_warmup_iters = int(getattr(args, "lag_warmup_iters", 0))
 
         pid_i = 0.0
         pid_prev_jc = None
@@ -122,6 +123,8 @@ class LagrPPO:
                     seg = envs.collect(agent, batch_size, device, with_cost=True)
                     prev_step, global_step = global_step, global_step + batch_size
                     raw_seg = seg.get("raw_costs", seg["costs"])
+                    rollout_raw_cost_sum = float(sum(sum(c) for c in raw_seg))
+                    rollout_steps = float(sum(len(c) for c in raw_seg))
                     for i in range(args.n_envs):
                         for c_t, rc_t, d_t in zip(seg["costs"][i], raw_seg[i], seg["dones"][i]):
                             ep_cost_acc[i] += c_t
@@ -213,6 +216,8 @@ class LagrPPO:
 
                     costs_q = costs[-int(8000/args.n_envs):, :].flatten()
                     costs_q_sum = float(costs_q.sum().item())
+                    rollout_raw_cost_sum = float(raw_costs.sum())
+                    rollout_steps = float(raw_costs.size)
 
                     # Bootstrap value if not done
                     with th.no_grad():
@@ -249,6 +254,8 @@ class LagrPPO:
                     dual_jc = costs_q_sum
                 elif dual_stat == "episode_mean":
                     dual_jc = float(np.mean(finished_ep_raw_costs)) if finished_ep_raw_costs else float(np.mean(ep_raw_cost_acc))
+                elif dual_stat == "step_rate_1k":
+                    dual_jc = 1000.0 * rollout_raw_cost_sum / max(1.0, rollout_steps)
                 else:  # "cost_rate"
                     if finished_ep_rates:
                         dual_jc = float(np.mean(finished_ep_rates))
@@ -257,20 +264,25 @@ class LagrPPO:
 
                 if lag_mode == "pid":
                     lag_before = pid_nu
-                    err = dual_jc - args.cost_threshold
-                    pid_i = max(0.0, pid_i + err)
-                    pid_d = 0.0 if pid_prev_jc is None else max(0.0, dual_jc - pid_prev_jc)
-                    pid_prev_jc = dual_jc
-                    pid_nu = max(0.0, min(args.lag_max, args.lag_kp * err + args.lag_ki * pid_i + args.lag_kd * pid_d))
+                    if iteration <= lag_warmup_iters:
+                        pid_prev_jc = dual_jc
+                    else:
+                        err = dual_jc - args.cost_threshold
+                        i_cap = (args.lag_max / args.lag_ki) if args.lag_ki > 0.0 else float("inf")
+                        pid_i = min(i_cap, max(0.0, pid_i + err))
+                        pid_d = 0.0 if pid_prev_jc is None else max(0.0, dual_jc - pid_prev_jc)
+                        pid_prev_jc = dual_jc
+                        pid_nu = max(0.0, min(args.lag_max, args.lag_kp * err + args.lag_ki * pid_i + args.lag_kd * pid_d))
                     lag_after = pid_nu
                     nu_val = pid_nu
                     multiplier = th.tensor(pid_nu, dtype=th.float32, device=device)
                 else:
                     lag_before = float(lag_mul.item())
-                    lag_loss = -lag_mul * (th.tensor(dual_jc, dtype=th.float32, device=device) - args.cost_threshold)
-                    lag_optim.zero_grad()
-                    lag_loss.backward()
-                    lag_optim.step()
+                    if iteration > lag_warmup_iters:
+                        lag_loss = -lag_mul * (th.tensor(dual_jc, dtype=th.float32, device=device) - args.cost_threshold)
+                        lag_optim.zero_grad()
+                        lag_loss.backward()
+                        lag_optim.step()
                     lag_after = float(lag_mul.item())
                     nu_val = float(softplus(lag_mul).item())
                     multiplier = softplus(lag_mul).detach()

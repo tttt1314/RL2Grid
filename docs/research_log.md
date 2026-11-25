@@ -108,3 +108,11 @@
   3. **O4 與 C2 震盪細節：** `E2_C2` 第 1 輪 `kl = 5.523`、`J_c = 31279`，巨幅梯度撐大 `exp_avg_sq`，使 $\lambda$ 僅緩慢升至 `1.355`（非 `+0.05/step`）；第 15–17 輪出現 `kl = 0.88 / 1.26 / 0.69` 崩跌（`eval_surv` 掉至 `0.105`），第 28–30 輪 `eval_cost` 更飆至 `55.9 / 106.3 / 119.5`。
   4. **Post-hoc 解析 `E1B` 偏低與 `E1` vs. `PPO_T_V` 差距：** `E1B` 在 3M 步將 `actor_lr=3e-5` 線性退火至 0（`PPO_T_V` 為 5M 退火），到 `2.6M–3.0M` 時 `kl` 已縮至 `0.0018 → 0.00001` 而提前停止學習；此外查 `env/utils.py` 與 `env/reward.py` 發現，`OverloadReward(constrained=True)` 會將斷線懲罰設為 `0.0`（無約束 PPO 為 `-1.0`），形成 `constraints_type=1` 的隱藏環境差異。
 - **路線影響：** 後續進入 **RD2＋RD1** 實作時，優先單獨驗證「cost advantage 標準化＋PPO clip＋`--target-kl`」（針對 O5）的改善幅度，再疊加 PID Lagrangian 與修正後的電網 CMDP 定義。
+
+### 2026-11-25 19:55 UTC+8 · 學習曲線繪製與研究方向文件同步更新
+- **繪圖腳本與圖表：** 新增 `tools/plot_curves.py`，由本機 `final_proj/vm_logs/state/` 產出兩張 2×2 圖表並同步至 `docs/figures/` 與 `final_proj/figures/`：
+  - [bus14_seed0_learning_curves.png](figures/bus14_seed0_learning_curves.png)：seed 0 全 14 組基準之評估存活率曲線（含 3-eval 移動平均與論文 Table 2/3 對照線）。
+  - [e1_e2_diagnostic_curves.png](figures/e1_e2_diagnostic_curves.png)：E1／E2／E1B 存活率對照、E2-C1「前衝後鎖」dual 動態、四組 `approx_kl` 對比，以及 E2-C2 中期崩跌與末期 `eval_cost` 飆升。
+- **文件同步更新與峰值更正：**
+  - 更新 [research_directions_rl2grid.md](research_directions_rl2grid.md) §2（補齊全 14 組 `訓練中最好` 並嵌入基準學習曲線）、§3（補上 `OverloadReward(constrained=True)` 程式碼發現、O2／O4／O5／O6 的 E1／E2／E1B 實證更正）、§4–§6（標記 E1／E1B／E2 已完成、嵌入診斷圖、拆出下一步 **E6a** O5 消融與 **E6b** RD1＋RD2）。
+  - 更新 [reproduction_bus14_seed0.md](reproduction_bus14_seed0.md) §2／§5／§6，補齊「訓練中最好」欄位並嵌入學習曲線；**更正對象：** 原註記「`SAC V` 拓撲最好為 `0.22 @ 1.5M`」，對照完整 `SAC_T_V_s0` log 後實際峰值为 **`0.3546 @ 250k`**（1.5M 步時為 `0.2517`，之後逐步崩潰至 `0.01`）。

@@ -149,18 +149,20 @@ $$
 
 ## 2. Reproduction 結果摘要
 
-📊 bus14、difficulty 0、seed 0。數值為最後 3 次評估的平均存活率；「最好」是訓練過程中單次評估的最高值。
+📊 bus14、difficulty 0、seed 0。數值為最後 3 次評估的平均存活率；「訓練中最好」是完整 log 內單次評估的最高值。
 
 | 設定 | 預算 | 論文 | Seed 0（最後 3 次） | 訓練中最好 |
 |---|---|---|---|---|
-| PPO V（拓撲） | 5M | 0.74 | 0.67 | — |
-| PPO I / R | 500k | 0.99 / 0.97 | 0.90 / 0.80 | — |
-| DQN V / I / R | 5M / 500k / 500k | 0.07 / 0.86 / 0.74 | 0.10 / 0.97 / 0.68 | — |
-| SAC V（拓撲） | 5M | 0.17 | 0.01 | 0.22 @ 1.5M |
-| SAC I / R | 500k | 0.56 / 0.16 | 0.85 / 0.62 | — |
-| PPO / SAC / TD3（redispatch） | 5M | 0.17 / 0.01 / 0.06 | 0.16 / 0.19 / 0.15 | SAC 0.42 @ 4.6M |
+| PPO V（拓撲） | 5M | 0.74 | 0.67（3M 時為 0.71） | 0.86 @ 4.20M（3M 前 0.84 @ 2.66M） |
+| PPO I / R | 500k | 0.99 / 0.97 | 0.90 / 0.80 | 1.00 @ 340k / 0.90 @ 380k |
+| DQN V / I / R | 5M / 500k / 500k | 0.07 / 0.86 / 0.74 | 0.10 / 0.97 / 0.68 | 0.34 @ 4.85M / 1.00 @ 250k / 0.87 @ 250k |
+| SAC V（拓撲） | 5M | 0.17 | 0.01 | 0.35 @ 250k（1.5M 仍約 0.25，之後崩潰） |
+| SAC I / R | 500k | 0.56 / 0.16 | 0.85 / 0.62 | 1.00 @ 50k / 1.00 @ 250k |
+| PPO / SAC / TD3（redispatch） | 5M | 0.17 / 0.01 / 0.06 | 0.16 / 0.19 / 0.15 | 0.40 @ 1.0M / 0.42 @ 4.6M / 0.37 @ 500k |
 | LagrPPO LSI（C1，門檻 50） | 3M | 只有曲線 | 0.32（cost 0.87 / episode） | 0.51 @ 2.1M |
 | LagrPPO TLO（C2，門檻 0） | 3M | 只有曲線 | 0.50（cost 60.7 / episode） | 0.79 @ 1.0M |
+
+![bus14 seed 0 基準學習曲線](figures/bus14_seed0_learning_curves.png)
 
 ---
 
@@ -178,6 +180,7 @@ $$
 所以 C1 實際上是「失敗次數約束」，和存活率本身幾乎是同一件事（見 O3）。
 
 - 🔍 TLO 的程式實作和論文一致： $c_t = \#\text{斷線}(\text{排除維修與 opponent}) + \#\text{過載}$。
+- 🔍 **隱藏的 reward 差異（`env/utils.py` 與 `env/reward.py`）：** 只要 `--constraints-type != 0`，`OverloadReward(constrained=True)` 就會把斷線懲罰 `self.penalty` 設為 `0.0`（無約束 PPO 為 `-1.0`）。在 C1（僅失敗當步 cost=1）中，這讓 agent 在 reward 與 cost 兩側都完全沒有斷線懲罰。
 
 ### O2. 拉格朗日乘數用的 cost 統計量和約束定義的單位不一致
 
@@ -193,15 +196,12 @@ $$
 1. 論文的約束是**每個 episode** 的累積 cost（ $\sum_{t=0}^{T}$），單位不同。
 2. Policy 那一側用的 cost advantage $\hat{A}^C_t$ 是用 $\gamma = 0.9$ **折扣**的 $V_C$ 算的，有效視野只有約 10 步。dual 和 primal 看的是兩個不同的量。
 
-**C1 什麼時候約束才會觸發？** 💭 若每個 episode 都以失敗結束、平均長度為 $\bar{L}$，則 8000 個 transition 裡約有 $8000/\bar{L}$ 次失敗：
+**C1 的實際動態（📊 E2-C1 實測更正）：** 我們原先只看平衡態（存活 > 2% 即 $\bar{L} > 160 \Rightarrow \hat{J}_C < 50$），推測訓練大部分時間 $\lambda$ 會一路往下掉；但 E2-C1 完整 30 輪（每輪 100k 步）軌跡與既有 `final_LAGRPPO_C1.tar` 揭露了更嚴重的**「前衝後鎖」**：
 
-$$
-\hat{J}_C \approx \frac{8000}{\bar{L}} > d = 50 \iff \bar{L} < 160 \iff \text{survival} = \frac{\bar{L}}{T_{\max}} < \frac{160}{8064} \approx 2\%.
-$$
+1. **前 14 輪（`100k–1.4M`）：** 平均 episode 長度為 `6.5 → 180.2` 步，導致 $\hat{J}_C = 1216 \to 60 > 50$，把 $\lambda$ 從初始 `1.0` 推高到 `1.418`（ $\nu = 1.635$）。
+2. **第 15–30 輪（`1.5M–3.0M`）：** $\hat{J}_C$ 已降到門檻以下（ `48 → 14–26`），但受前期累積的 Adam 動量（`exp_avg`）與只有 30 輪 dual 更新限制， $\lambda$ 仍繼續靠慣性上升到第 28–29 輪的 **`1.504`**（ $\nu = 1.704$），第 30 輪才剛微幅反轉為 `1.503`（原基準 checkpoint 為 `1.4806`）。也就是說， **C1 的 $\lambda$ 在後半段反而被鎖在高點、完全退不下來**。
 
-📊 C1 第一次評估就已經是 2.2%，之後都在 2% 以上。💭 也就是說，訓練大部分時間 $\hat{J}_C < d$， $\lambda$ 會一直下降，**C1 實際上等同於沒有約束的 PPO**。
-
-**C2：** 門檻 $d = 0$，而 $\hat{J}_C \ge 0$ 幾乎必定大於 0，所以 $e_k = \hat{J}_C - d > 0$ 永遠成立， $\lambda$ 只會單調上升（見 O4）。
+**C2：** 門檻 $d = 0$，而 $\hat{J}_C \ge 0$ 幾乎必定大於 0，所以 $e_k = \hat{J}_C - d > 0$ 永遠成立， $\lambda$ 全程單調上升（見 O4）。
 
 ### O3. 約束可以靠「早點失敗」躲掉（termination escape）
 
@@ -227,17 +227,11 @@ $$
 
 📊 和 C2 的現象一致：存活率在 0.07–0.79 之間大幅震盪，最好值出現在早期（1.0M），之後下滑。📄 [P §4, Fig. 6] 也觀察到「約束版的過載違反反而比沒約束的更嚴重」。💭 這個機制提供了一個可以驗證的解釋。
 
-### O4. 用 Adam 更新 $\lambda$，只能以固定速率變化
+### O4. 用 Adam 更新 $\lambda$，在尺度劇變下呈現不對稱步長與慣性
 
-Adam 的更新量約為 $\eta \cdot \hat{m}/(\sqrt{\hat{v}} + \epsilon)$。當梯度符號固定（例如 C2 永遠違反）時， $\hat{m}/\sqrt{\hat{v}} \approx \pm 1$，所以：
+Adam 的更新量約為 $\eta_\lambda \cdot \hat{m}/(\sqrt{\hat{v}} + \epsilon)$。當梯度符號固定且梯度尺度平穩時， $\hat{m}/\sqrt{\hat{v}} \approx \pm 1$，速率和違反程度無關；而當早期與後期梯度尺度差數百倍時（例如 📊 E2-C2 的 $\hat{J}_C$ 從首輪 `31279` 降到中後期 `53–784`），初期巨幅梯度把二階矩 `exp_avg_sq` 撐大（原 C2 checkpoint 達 `919093`），使後續步長縮至小於 `0.05`——實測 E2-C2 30 輪後僅升至 `1.355`（原 C2 為 `1.3626`），而非等差升到 `2.50`。相反地，在 E2-C1 中一階動量 `exp_avg` 則造成過衝後的慣性鎖死（O2）。這正是 PID Lagrangian 要解決的「缺乏比例即時反應、積分累積超調／慣性」問題（RD2）。
 
-$$
-\lambda_K \approx \lambda_0 + \eta_\lambda K,
-$$
-
-其中 🔍 $\eta_\lambda = 0.05$（`--lag-lr` 預設值）， $K$ 是 policy update 的次數。速率**和違反程度無關**：違反 1 次和違反 1000 次， $\lambda$ 都一樣只增加 0.05。reward 在 loss 裡的權重 $1/(1+\nu)$ 會持續下降，到後期幾乎只剩 cost 項。這就是 PID Lagrangian 要解決的「反應太慢又容易超調」問題（RD2）。
-
-### O5. Cost 項沒有 trust region，而且和 reward 項的尺度不同
+### O5. Cost 項沒有 trust region，而且和 reward 項的尺度不同（📊 E1 / E2 實證為主因）
 
 🔍 reward advantage 有標準化 $(\hat{A} - \mu)/\sigma$，也有 clip；cost advantage **只減去平均、沒有除以 $\sigma$、也沒有 clip**：
 
@@ -245,16 +239,23 @@ $$
 \hat{A}^C_t \leftarrow \hat{A}^C_t - \text{mean}(\hat{A}^C), \qquad \text{cost 項} = \mathbb{E}_t\left[r_t(\theta)\hat{A}^C_t\right] \ (\text{無 clip}).
 $$
 
-💭 $\nu$ 很大時，cost 項主導梯度，PPO clip 對它沒有限制作用。再加上 🔍 LagrPPO 預設 `--update-epochs 80`、`--target-kl None`，同一批資料會被重複更新很多次，策略容易一步走太遠。
+加上 🔍 LagrPPO 預設 `--update-epochs 80`、`--target-kl None`，當 $\nu$ 被 O2/O4 鎖在高點（`1.35–1.70`）時，cost 項佔梯度 57%–63%，策略會大幅跨出 trust region。📊 **E1 與 E2 直接證實這一點：**
+- **E1（ $\nu \approx 0$，其餘超參數與 C1 完全相同）：** 第 1 輪 `kl = 0.04863`、`clipfrac = 0.3536`，第 3 輪起 `kl` 穩於 `0.008–0.022`，最後 3 次存活率達 **`0.579`**（最好 `0.643`）。
+- **E2-C1（ $\nu = 1.35 \to 1.70$）：** 第 1 輪即爆出 **`kl = 0.70715`**（E1 的 14.5 倍）、`clipfrac = 0.5709`，第 20 輪（2M）仍突跳 `0.106`，存活率僅 **`0.355`**。
+- **E2-C2（ $\nu = 1.35 \to 1.58$）：** 第 1 輪 `kl = 5.52301`，第 15–17 輪出現 `kl = 0.88 / 1.26 / 0.69` 的連續暴衝，評估存活率當場從 `0.422` 崩跌到 `0.105`。
 
-### O6. C1 和 PPO V 的比較有混淆變因
+### O6. C1 與 PPO V 的超參數混淆（📊 E1 / E1B 實測更正）
 
-| | actor lr | update epochs | 步數預算 | 約束 |
-|---|---|---|---|---|
-| PPO V（🔍 `alg/ppo/config.py`） | 3e-5 | 40 | 5M | 無 |
-| LagrPPO C1（🔍 `alg/lagr_ppo/config.py`） | 3e-4 | 80 | 3M | 有（但依 O2 幾乎不觸發） |
+| | actor lr | update epochs | 網路（actor / critic） | `n_steps` / 預算 | 約束（實際 $\nu$） | 3M 結果（最後 3 次） |
+|---|---|---|---|---|---|---|
+| PPO V（`alg/ppo/config.py`） | 3e-5 | 40 | 256-128-64 / 512-256-128 | 400 / 5M | 無（有斷線 reward） | **0.71**（5M 時 0.67） |
+| E1（C1 超參數、 $\nu \approx 0$） | 3e-4 | 80 | 256-256 / 256-256 | 2000 / 3M | 無斷線 reward、 $\nu \approx 0$ | **0.58**（最好 0.64） |
+| E1B（PPO 超參數、 $\nu \approx 0$） | 3e-5 | 40 | 256-128-64 / 512-256-128 | 400 / 3M | 無斷線 reward、 $\nu \approx 0$ | **0.25**（最好 0.44） |
+| E2-C1 / 原 C1 | 3e-4 | 80 | 256-256 / 256-256 | 2000 / 3M | $\nu = 1.35 \to 1.70$ | **0.36 / 0.32** |
 
-📊 C1 0.32、PPO V 0.67。💭 差距可能主要來自 lr ×10、epochs ×2 和較少的步數，**而不是約束**。📄 論文說「約束版學不起來」，可能也受到同樣的混淆影響。
+📊 **E1 與 E1B 推翻了「C1 低分主要來自超參數」的原推論：**
+1. 固定相同 LagrPPO 超參數、只把 $\nu$ 歸零（E1），存活率就從 `0.32–0.36` 跳到 `0.58`，證明**主要拖垮 C1 的是 O5＋O2（未 clip 的 cost 項＋卡在高點的 $\lambda$）**，不是 `3e-4 / 80 epochs`。
+2. 反而是沿用 PPO 小學習率 `3e-5` 的 `E1B` 在 3M 步只有 `0.25`，因為 `anneal_lr=True` 在 3M 就將本已較小的學習率線性退火到 0（2.6M–3.0M 時 `kl` 已縮至 `0.0018 → 0.00001`、`clipfrac = 0.0000`），而 `PPO_T_V` 在 3M 時仍保留 40% 學習率；此外 `OverloadReward(constrained=True)` 也移除了斷線懲罰（O1）。
 
 ### O7. Heuristic 的 n 步轉移在 bootstrap 時少乘了折扣
 
@@ -372,7 +373,7 @@ $$
 \mathcal{L}_{\text{actor}} = \frac{-L^{\text{CLIP}}_R + \nu L^{\text{CLIP}}_C}{1 + \nu}.
 $$
 
-**實驗設計**：在 RD1 修正後的 CMDP 上比較 {原版 Adam、PID、PID + clipped cost}，看 $\lambda$ 軌跡、cost 震盪幅度、存活率。
+**實驗設計**：先單獨消融 **O5 修復**（cost advantage 標準化＋PPO clip＋`--target-kl`），再在 RD1 修正後的 CMDP 上比較 {原版 Adam、clip+KL、PID+clip+KL}，看 $\lambda$ 軌跡、`approx_kl`、cost 震盪與存活率。E1／E2 結果顯示修復 O5 是最直接高報酬的起點。
 
 **風險**：PID 增益需要調。可以先用 Stooke et al. 建議的範圍，再做小規模 grid search。
 
@@ -543,7 +544,7 @@ $$
 | RD8 V-trace async | 低 | 高 | — | 無 | 系統加分 |
 
 **建議組合**：
-- **主線**：RD1 + RD2，用 RD7 的評估方式報告結果。
+- **主線**：先完成 O5 修復消融（cost advantage 標準化＋PPO clip＋`--target-kl`，E1／E2 已證明此項槓桿最大），再疊加 RD2（PID Lagrangian）＋ RD1（well-posed CMDP），用 RD7 的評估方式報告結果。
 - **延伸**：RD3，順便修正 O7。
 - 有多餘人力的話，RD4 或 RD6 可以交給一位同學獨立做。
 
@@ -551,18 +552,30 @@ $$
 
 ## 6. 第一批建議實驗
 
-依照「最便宜、最能驗證假設」排序。運算時間依我們的實測（async LagrPPO 約 650 SPS，3M 步約 75 分鐘；VM 一次可同時跑 2 個 job）。
+依照「最便宜、最能驗證假設」排序。運算時間依我們的實測（async LagrPPO 約 650–710 SPS，3M 步約 75 分鐘；VM 一次可同時跑 2 個 job）。
 
-| # | 實驗 | 驗證什麼 | 估計時間 |
-|---|---|---|---|
-| E1 | LagrPPO C1 設定、 $\lambda \equiv 0$ | O6：C1 低分是否來自超參數 | ~75 分鐘 |
-| E2 | 在 LagrPPO log 中加入 $\lambda$、 $\hat{J}_C$ | O2、O4： $\lambda$ 是否如預測變化 | 改程式 + 重跑 C1/C2 ~75 分鐘（並行） |
-| E3 | 拿現有 checkpoint 在保留的 chronics 上評估 | RD7：泛化落差 | < 30 分鐘 |
-| E4 | PPO I， $\rho_{\text{th}} \in \lbrace 0.90, 0.95, 0.98 \rbrace$ | RD3(a)：對門檻的敏感度 | 每個約 1 小時 |
-| E5 | PPO I，SMDP 折扣修正（ $\gamma^{n+1}$） | O7 | ~1 小時 |
-| E6 | E1–E2 結果正面後：RD1 新定義 + RD2 PID | 主線 | 每個設定 ~75 分鐘 × 3 seeds |
+| # | 實驗 | 狀態 | 驗證什麼 | 實測／估計結果 |
+|---|---|---|---|---|
+| E1 | LagrPPO C1 設定、 $\nu \approx 0$（`--lag-lr 0 --lag-mul -20`） | ✅ **已完成** | O5／O6：拿掉約束後是否回升 | **0.579**（最好 0.643），大幅勝過 E2-C1（0.355） |
+| E1B | $\nu \approx 0$ ＋ PPO 超參數/網路（3M） | ✅ **已完成** | O6：3M 步下 PPO 超參影響 | **0.250**（`3e-5` 3M 退火過早歸零＋無斷線 reward） |
+| E2 | 加入 `LagrRollout` 印出 $\lambda, \nu, \hat{J}_C, \text{kl}$，重跑 C1/C2 | ✅ **已完成** | O2／O4／O5 動態軌跡 | 證實 E2-C1 `kl=0.707` 與 $\lambda$ 過衝鎖高（`1.504`）；E2-C2 末期 `eval_cost` 飆至 `93.9` |
+| E3 | 泛化落差評估（需先加 `--chronics-split` 並存 `obs_rms`） | ⏳ 待辦 | RD7：train vs. unseen test | 程式碼稽核發現 seed 0 已跑遍 1,004 chronics 且未存 `obs_rms`，須切分重訓代表組（~1.5 小時）或暖機評固定 50 eps（~25 分鐘） |
+| E4 | PPO I， $\rho_{\text{th}} \in \lbrace 0.90, 0.95, 0.98 \rbrace$ | ⏳ 待辦 | RD3(a)：對門檻的敏感度 | 每個約 1 小時 |
+| E5 | PPO I，SMDP 折扣修正（ $\gamma^{n+1}$） | ⏳ 待辦 | O7 | ~1 小時 |
+| E6a | **LagrPPO O5 修復消融**（cost adv 標準化＋clip＋`--target-kl`） | ⏳ **推薦下一步** | 單獨消除 E2-C1/C2 的 `kl` 暴衝 | C1 + C2 約 1.5 小時（並行） |
+| E6b | **RD1 新 CMDP ＋ RD2 PID Lagrangian** | ⏳ **主線** | 解決「前衝後鎖」、早死逃逸與末期 cost 飆升 | 每個設定 ~75 分鐘 × 3 seeds |
 
-E1、E2、E3 加起來約一個 5 小時的 batch 就能完成，而且結果會直接決定 RD1 是否值得當主軸。
+### E1 / E2 / E1B 實測總結（2026-11-25，seed 0，3M 步）
+
+| Job | 最後 3 次存活率 | 訓練中最好 | 最後 3 次 `cost_return` | 首輪 `kl` | 最終 `lag_mul` / `nu` |
+|---|---|---|---|---|---|
+| `PPO_T_V` @ 3M（對照） | **0.7104** (0.68–0.74) | 0.8421 @ 2.66M | — | — | — |
+| `E1_LAGRPPO_C1_LAM0` | **0.5786** (0.54–0.64) | 0.6428 @ 2.8M | 0.70 | 0.0486 | `-20.0` / `0.00` |
+| `E1B_LAGRPPO_C1_PPOCFG` | **0.2498** (0.19–0.30) | 0.4386 @ 2.0M | 0.97 | 0.0133 | `-20.0` / `0.00` |
+| `E2_LAGRPPO_C1`（門檻 50） | **0.3552** (0.30–0.46) | 0.4612 @ 2.9M | 0.93 | **0.7072** | `1.503` / `1.704` |
+| `E2_LAGRPPO_C2`（門檻 0） | **0.5592** (0.49–0.62) | 0.8122 @ 2.3M | **93.90** | **5.5230** | `1.355` / `1.584` |
+
+![E1/E2/E1B 診斷曲線](figures/e1_e2_diagnostic_curves.png)
 
 ---
 
@@ -606,9 +619,11 @@ E1、E2、E3 加起來約一個 5 小時的 batch 就能完成，而且結果會
 | 內容 | 檔案 |
 |---|---|
 | CMDP cost wrapper | `env/cmdp.py` |
+| Reward 與 `OverloadReward` | `env/reward.py`、`env/utils.py` |
 | Heuristic wrapper、 $\rho_{\text{th}}$ | `env/heuristic.py` |
 | $\gamma$ 等環境參數 | `env/config.py` |
-| LagrPPO（ $\lambda$ 更新、actor loss） | `alg/lagr_ppo/core.py`、`alg/lagr_ppo/config.py` |
+| LagrPPO（ $\lambda$ 更新、actor loss、 `LagrRollout` log） | `alg/lagr_ppo/core.py`、`alg/lagr_ppo/config.py` |
 | PPO 超參數 | `alg/ppo/config.py` |
 | SAC（entropy autotune） | `alg/sac/core.py` |
 | 非同步收集、分段 GAE | `common/async_collector.py` |
+| 學習曲線繪圖腳本 | `tools/plot_curves.py` |

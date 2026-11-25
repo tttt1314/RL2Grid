@@ -22,12 +22,13 @@ ROLL_RE = re.compile(
     r"n_ep=(\d+) ep_cost=([\w.eE+-]+) ep_len=([\w.eE+-]+) "
     r"kl=([\d.eE+-]+) clipfrac=([\d.eE+-]+) "
     r"pg_r=([\d.eE+-]+) surr_c=([\d.eE+-]+) ent=([\d.eE+-]+)"
+    r"(?: ep_raw_cost=([\w.eE+-]+) ep_rate=([\w.eE+-]+) epochs=(\d+))?"
 )
 
 
 def parse_job(job_dir: Path) -> dict:
     eval_map: dict[int, tuple[float, float | None]] = {}
-    rollouts: list[dict[str, float | int]] = []
+    rollouts: list[dict[str, float | int | None]] = []
     for log_path in sorted(job_dir.glob("seg_*.log")):
         for line in log_path.read_text(errors="ignore").splitlines():
             m = EVAL_RE.search(line)
@@ -55,6 +56,9 @@ def parse_job(job_dir: Path) -> dict:
                     "pg_r": float(mr.group(13)),
                     "surr_c": float(mr.group(14)),
                     "ent": float(mr.group(15)),
+                    "ep_raw_cost": float(mr.group(16)) if mr.group(16) is not None else None,
+                    "ep_rate": float(mr.group(17)) if mr.group(17) is not None else None,
+                    "epochs": int(mr.group(18)) if mr.group(18) is not None else None,
                 })
     steps = np.array(sorted(eval_map), dtype=float)
     survs = np.array([eval_map[int(s)][0] for s in steps], dtype=float)
@@ -296,6 +300,131 @@ def make_diagnostic_figure(jobs: dict[str, dict], out_path: Path) -> None:
     plt.close(fig)
 
 
+def _eval_summary(data: dict, max_step: float | None = None) -> tuple[float, float, float]:
+    """Return (last3_survival_mean, best_survival, last3_cost_mean) within max_step."""
+    steps, survs, costs = data["steps"], data["survs"], data["costs"]
+    if max_step is not None:
+        mask = steps <= max_step
+        survs = survs[mask]
+        costs = costs[mask]
+    last3_surv = float(np.mean(survs[-3:]))
+    best_surv = float(np.max(survs))
+    valid_costs = costs[-3:][~np.isnan(costs[-3:])]
+    last3_cost = float(np.mean(valid_costs)) if len(valid_costs) > 0 else float("nan")
+    return last3_surv, best_surv, last3_cost
+
+
+def make_batch1_figure(jobs: dict[str, dict], out_path: Path) -> None:
+    """Plot 2x2 comparison across E2 baselines, E6a O5-fix ablation, and E6b PID+CMDP."""
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 9.2), dpi=180)
+    fig.suptitle(
+        "LagrPPO Batch 1 (E6a O5-Fix & E6b PID+CMDP) vs. E1/E2 — bus14, seed 0",
+        fontsize=13.5,
+        fontweight="bold",
+        y=0.98,
+    )
+
+    ppo_s3, ppo_best, _ = _eval_summary(jobs["PPO_T_V_s0"], max_step=3_000_000)
+
+    # Panel A: C1 Failure-Constrained Eval Survival (0-3M)
+    ax = axes[0, 0]
+    plot_eval_series(
+        ax, jobs["PPO_T_V_s0"],
+        f"PPO V <=3M (last3={ppo_s3:.3f}, best={ppo_best:.3f})",
+        "0.40", "--", max_step=3_000_000, linewidth=1.7,
+    )
+    c1_specs = [
+        ("E1_LAGRPPO_C1_LAM0_s0", "E1: nu~0", "tab:green", "-"),
+        ("E2_LAGRPPO_C1_s0", "E2-C1: orig C1", "tab:red", "-"),
+        ("E6A_C1_O5FIX_s0", "E6a-C1: O5 fix", "tab:orange", "-"),
+        ("E6B_C1_PID_RD1_s0", "E6b-C1: PID+RD1", "tab:blue", "-"),
+    ]
+    for jid, name, color, ls in c1_specs:
+        l3, bst, _ = _eval_summary(jobs[jid])
+        plot_eval_series(ax, jobs[jid], f"{name} (last3={l3:.3f}, best={bst:.3f})", color, ls)
+    style_axes(ax, max_step=3_000_000, ylim=(-0.02, 1.03))
+    ax.set_title("A. Failure-Constrained (C1) Eval Survival")
+    ax.set_xlabel("Environment Steps")
+    ax.set_ylabel("Eval Survival (10 eps, 3-eval MA)")
+    ax.legend(loc="upper left", fontsize=7.8, frameon=True, framealpha=0.92)
+
+    # Panel B: C2 Overload-Constrained Eval Survival (0-3M)
+    ax = axes[0, 1]
+    plot_eval_series(
+        ax, jobs["PPO_T_V_s0"],
+        f"PPO V <=3M (last3={ppo_s3:.3f})",
+        "0.40", "--", max_step=3_000_000, linewidth=1.7,
+    )
+    c2_specs = [
+        ("E2_LAGRPPO_C2_s0", "E2-C2: orig C2", "tab:purple", "-", "c"),
+        ("E6A_C2_O5FIX_s0", "E6a-C2: O5 fix", "tab:cyan", "-", "c"),
+        ("E6B_C2_PID_RD1_s0", "E6b-C2: PID+RD1", "tab:brown", "-", "c*"),
+    ]
+    for jid, name, color, ls, c_tag in c2_specs:
+        l3, bst, c3 = _eval_summary(jobs[jid])
+        plot_eval_series(
+            ax, jobs[jid],
+            f"{name} (last3={l3:.3f}, best={bst:.3f}, {c_tag}={c3:.1f})",
+            color, ls,
+        )
+    style_axes(ax, max_step=3_000_000, ylim=(-0.02, 1.03))
+    ax.set_title("B. Overload-Constrained (C2) Eval Survival (*c incl. absorb)")
+    ax.set_xlabel("Environment Steps")
+    ax.set_ylabel("Eval Survival (10 eps, 3-eval MA)")
+    ax.legend(loc="upper left", fontsize=7.6, frameon=True, framealpha=0.92)
+
+    # Panel C: Trust-Region approx_kl (log scale)
+    ax = axes[1, 0]
+    kl_specs = [
+        ("E2_LAGRPPO_C1_s0", "E2-C1 (no O5 fix)", "tab:red", "-"),
+        ("E2_LAGRPPO_C2_s0", "E2-C2 (no O5 fix)", "tab:purple", "--"),
+        ("E6A_C1_O5FIX_s0", "E6a-C1 (O5 fix)", "tab:orange", "-"),
+        ("E6A_C2_O5FIX_s0", "E6a-C2 (O5 fix)", "tab:cyan", "-"),
+        ("E6B_C1_PID_RD1_s0", "E6b-C1 (PID+RD1)", "tab:blue", "-"),
+        ("E6B_C2_PID_RD1_s0", "E6b-C2 (PID+RD1)", "tab:brown", "-"),
+    ]
+    for jid, name, color, ls in kl_specs:
+        rs = jobs[jid]["rollouts"]
+        xs = np.array([r["step"] for r in rs], dtype=float)
+        ys = np.maximum(np.array([r["kl"] for r in rs], dtype=float), 1e-5)
+        ax.plot(xs, ys, color=color, linestyle=ls, linewidth=1.7, label=f"{name} (max={float(np.max(ys)):.3f})")
+    ax.axhline(0.02, color="0.35", linestyle=":", linewidth=1.3, label="target_kl = 0.02")
+    ax.set_yscale("log")
+    style_axes(ax, max_step=3_000_000, ylim=(2e-3, 12.0))
+    ax.set_title("C. Trust-Region Stability: approx_kl Eliminates Spikes")
+    ax.set_xlabel("Environment Steps")
+    ax.set_ylabel("Approx KL (log scale)")
+    ax.legend(loc="upper right", fontsize=7.5, frameon=True, framealpha=0.92)
+
+    # Panel D: Dual Multiplier nu (log scale)
+    ax = axes[1, 1]
+    nu_specs = [
+        ("E2_LAGRPPO_C1_s0", "E2-C1 (Adam, LSI d=50)", "tab:red", "--"),
+        ("E2_LAGRPPO_C2_s0", "E2-C2 (Adam, TLO d=0)", "tab:purple", "--"),
+        ("E6A_C1_O5FIX_s0", "E6a-C1 (Adam+O5, LSI d=50)", "tab:orange", "-"),
+        ("E6A_C2_O5FIX_s0", "E6a-C2 (Adam+O5, TLO d=0)", "tab:cyan", "-"),
+        ("E6B_C1_PID_RD1_s0", "E6b-C1 (PID, ep_mean d=0.5)", "tab:blue", "-"),
+        ("E6B_C2_PID_RD1_s0", "E6b-C2 (PID, cost_rate d=0.05)", "tab:brown", "-"),
+    ]
+    for jid, name, color, ls in nu_specs:
+        rs = jobs[jid]["rollouts"]
+        xs = np.array([r["step"] for r in rs], dtype=float)
+        ys = np.array([r["nu"] for r in rs], dtype=float)
+        ax.plot(xs, ys, color=color, linestyle=ls, linewidth=1.8, label=f"{name} (-> {float(ys[-1]):.2f})")
+    ax.set_yscale("log")
+    style_axes(ax, max_step=3_000_000, ylim=(0.45, 22.0))
+    ax.set_yticks([0.5, 1.0, 2.0, 4.0, 8.0, 16.0])
+    ax.get_yaxis().set_major_formatter(FuncFormatter(lambda y, _: f"{y:g}"))
+    ax.set_title("D. Dual Weight nu: Adam Lock & PID Integral Windup")
+    ax.set_xlabel("Environment Steps")
+    ax.set_ylabel("Effective Dual Multiplier nu (log scale)")
+    ax.legend(loc="upper left", fontsize=7.2, frameon=True, framealpha=0.92)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.955])
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--logs-dir", type=Path, required=True)
@@ -307,6 +436,9 @@ def main() -> None:
 
     make_baseline_figure(jobs, args.out_dir / "bus14_seed0_learning_curves.png")
     make_diagnostic_figure(jobs, args.out_dir / "e1_e2_diagnostic_curves.png")
+    batch1_keys = {"E6A_C1_O5FIX_s0", "E6A_C2_O5FIX_s0", "E6B_C1_PID_RD1_s0", "E6B_C2_PID_RD1_s0"}
+    if batch1_keys.issubset(jobs):
+        make_batch1_figure(jobs, args.out_dir / "e6_batch1_comparison.png")
     print("Generated figures in", args.out_dir)
 
 

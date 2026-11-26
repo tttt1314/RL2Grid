@@ -425,6 +425,129 @@ def make_batch1_figure(jobs: dict[str, dict], out_path: Path) -> None:
     plt.close(fig)
 
 
+def make_e6c_figure(jobs: dict[str, dict], out_path: Path) -> None:
+    """Plot 2x2 Stage-1 (E6c) comparison: PID anti-windup, step_rate_1k, absorbing scale, and keep-disc attribution."""
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 9.2), dpi=180)
+    fig.suptitle(
+        "LagrPPO Stage 1 (E6c): PID Anti-Windup, Unbiased Failure Rate & Scale Fix — bus14, seed 0",
+        fontsize=13.2,
+        fontweight="bold",
+        y=0.98,
+    )
+
+    ppo_s3, ppo_best, _ = _eval_summary(jobs["PPO_T_V_s0"], max_step=3_000_000)
+
+    # Panel A: Failure-Constrained (C1) & Attribution Eval Survival (0-3M)
+    ax = axes[0, 0]
+    plot_eval_series(
+        ax, jobs["PPO_T_V_s0"],
+        f"PPO V <=3M (last3={ppo_s3:.3f}, best={ppo_best:.3f})",
+        "0.40", "--", max_step=3_000_000, linewidth=1.6,
+    )
+    c1_specs = [
+        ("E1_LAGRPPO_C1_LAM0_s0", "E1: nu=0", "tab:green", "-", 1.7),
+        ("E1_C1_LAM0_KEEPDISC_s0", "E1+keep_disc: nu=0", "tab:olive", "--", 1.7),
+        ("E2_LAGRPPO_C1_s0", "E2-C1: orig C1", "tab:red", "-", 1.6),
+        ("E6B_C1_PID_RD1_s0", "E6b-C1: PID (ep_mean)", "tab:purple", "-", 1.7),
+        ("E6C_C1_PID_AW_s0", "E6c-C1: PID+AW+step_rate", "tab:blue", "-", 2.3),
+    ]
+    for jid, name, color, ls, lw in c1_specs:
+        l3, bst, _ = _eval_summary(jobs[jid])
+        plot_eval_series(
+            ax, jobs[jid], f"{name} (last3={l3:.3f}, best={bst:.3f})",
+            color, ls, linewidth=lw,
+        )
+    style_axes(ax, max_step=3_000_000, ylim=(-0.02, 1.03))
+    ax.set_title("A. Failure-Constrained (C1) & Attribution Eval Survival")
+    ax.set_xlabel("Environment Steps")
+    ax.set_ylabel("Eval Survival (10 eps, 3-eval MA)")
+    ax.legend(loc="upper left", fontsize=7.3, frameon=True, framealpha=0.92)
+
+    # Panel B: Overload-Constrained (C2) Eval Survival (0-3M)
+    ax = axes[0, 1]
+    plot_eval_series(
+        ax, jobs["PPO_T_V_s0"],
+        f"PPO V <=3M (last3={ppo_s3:.3f})",
+        "0.40", "--", max_step=3_000_000, linewidth=1.6,
+    )
+    c2_specs = [
+        ("E2_LAGRPPO_C2_s0", "E2-C2: orig C2", "tab:purple", "-", "c"),
+        ("E6A_C2_O5FIX_s0", "E6a-C2: O5 fix", "tab:cyan", "-", "c"),
+        ("E6B_C2_PID_RD1_s0", "E6b-C2: abs=1.0", "tab:brown", "--", "c*"),
+        ("E6C_C2_PID_ABS005_s0", "E6c-C2: abs=0.05", "tab:orange", "-", "c*"),
+        ("E6C_C2_PID_ABS010_s0", "E6c-C2: abs=0.10", "tab:pink", "-", "c*"),
+    ]
+    for jid, name, color, ls, c_tag in c2_specs:
+        l3, bst, c3 = _eval_summary(jobs[jid])
+        plot_eval_series(
+            ax, jobs[jid], f"{name} (last3={l3:.3f}, best={bst:.3f}, {c_tag}={c3:.1f})",
+            color, ls, linewidth=1.8,
+        )
+    style_axes(ax, max_step=3_000_000, ylim=(-0.02, 1.03))
+    ax.set_title("B. Overload-Constrained (C2) Eval Survival (*c incl. absorb)")
+    ax.set_xlabel("Environment Steps")
+    ax.set_ylabel("Eval Survival (10 eps, 3-eval MA)")
+    ax.legend(loc="upper left", fontsize=7.1, frameon=True, framealpha=0.92)
+
+    # Panel C: Dual Multiplier nu (focused [0, 3.8] linear scale)
+    ax = axes[1, 0]
+    nu_specs = [
+        ("E6B_C1_PID_RD1_s0", "E6b-C1: PID no-cap (0.6->3.50)", "tab:purple", "--", 1.7),
+        ("E6B_C2_PID_RD1_s0", "E6b-C2: abs=1.0 windup (->15.85, off-chart)", "tab:brown", ":", 1.6),
+        ("E6C_C2_PID_ABS005_s0", "E6c-C2: abs=0.05, cap=2.0 (->2.00)", "tab:orange", "-", 1.8),
+        ("E6C_C2_PID_ABS010_s0", "E6c-C2: abs=0.10, cap=2.0 (->2.00)", "tab:pink", "--", 1.8),
+        ("E6C_C1_PID_AW_s0", "E6c-C1: PID+AW (0->2.00->1.50)", "tab:blue", "-", 2.3),
+    ]
+    for jid, label, color, ls, lw in nu_specs:
+        rs = jobs[jid]["rollouts"]
+        xs = np.array([r["step"] for r in rs], dtype=float)
+        ys = np.array([r["nu"] for r in rs], dtype=float)
+        ax.plot(xs, ys, color=color, linestyle=ls, linewidth=lw, label=label)
+    ax.axhline(2.0, color="0.35", linestyle=":", linewidth=1.2, label="lag_max = 2.0")
+    ax.axvspan(0, 320_000, color="0.75", alpha=0.18)
+    ax.text(160_000, 3.62, "warmup\n(1-3)", ha="center", va="top", fontsize=7.2, color="0.35")
+    ax.annotate(
+        "2-way release!\n2.00 -> 1.50 (iters 27-30)",
+        xy=(2_950_000, 1.50),
+        xytext=(1_650_000, 0.72),
+        arrowprops=dict(arrowstyle="->", color="tab:blue", lw=1.2),
+        fontsize=7.6,
+        fontweight="bold",
+        color="tab:blue",
+    )
+    style_axes(ax, max_step=3_000_000, ylim=(-0.12, 3.85))
+    ax.set_title("C. Dual Multiplier nu: Clamped Anti-Windup & Two-Way Release")
+    ax.set_xlabel("Environment Steps")
+    ax.set_ylabel("Effective Dual Multiplier nu")
+    ax.legend(loc="upper left", bbox_to_anchor=(0.12, 0.99), fontsize=7.2, frameon=True, framealpha=0.92)
+
+    # Panel D: Normalized Constraint Violation Ratio J_c / threshold (log scale)
+    ax = axes[1, 1]
+    ratio_specs = [
+        ("E6B_C2_PID_RD1_s0", "E6b-C2: cost_rate / 0.05", "tab:brown", ":", 1.6),
+        ("E6B_C1_PID_RD1_s0", "E6b-C1: ep_mean / 0.50", "tab:purple", "--", 1.7),
+        ("E6C_C2_PID_ABS010_s0", "E6c-C2 (abs=0.10): cost_rate / 0.05", "tab:pink", "--", 1.8),
+        ("E6C_C2_PID_ABS005_s0", "E6c-C2 (abs=0.05): cost_rate / 0.03", "tab:orange", "-", 1.8),
+        ("E6C_C1_PID_AW_s0", "E6c-C1: step_rate_1k / 1.50", "tab:blue", "-", 2.3),
+    ]
+    for jid, name, color, ls, lw in ratio_specs:
+        rs = jobs[jid]["rollouts"]
+        xs = np.array([r["step"] for r in rs], dtype=float)
+        ratios = np.array([r["J_c"] / max(r["thresh"], 1e-8) for r in rs], dtype=float)
+        ax.plot(xs, ratios, color=color, linestyle=ls, linewidth=lw, label=f"{name} (-> {float(ratios[-1]):.2f}x)")
+    ax.axhline(1.0, color="tab:green", linestyle=":", linewidth=1.5, label="target satisfied (J_c / thresh = 1.0)")
+    ax.set_yscale("log")
+    style_axes(ax, max_step=3_000_000, ylim=(0.45, 160.0))
+    ax.set_title("D. Normalized Constraint Metric J_c / threshold (Log Scale)")
+    ax.set_xlabel("Environment Steps")
+    ax.set_ylabel("J_c / threshold (<= 1.0 means satisfied)")
+    ax.legend(loc="upper right", fontsize=7.2, frameon=True, framealpha=0.92)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.955])
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--logs-dir", type=Path, required=True)
@@ -439,6 +562,9 @@ def main() -> None:
     batch1_keys = {"E6A_C1_O5FIX_s0", "E6A_C2_O5FIX_s0", "E6B_C1_PID_RD1_s0", "E6B_C2_PID_RD1_s0"}
     if batch1_keys.issubset(jobs):
         make_batch1_figure(jobs, args.out_dir / "e6_batch1_comparison.png")
+    e6c_keys = {"E6C_C1_PID_AW_s0", "E6C_C2_PID_ABS005_s0", "E6C_C2_PID_ABS010_s0", "E1_C1_LAM0_KEEPDISC_s0"}
+    if e6c_keys.issubset(jobs):
+        make_e6c_figure(jobs, args.out_dir / "e6c_stage1_comparison.png")
     print("Generated figures in", args.out_dir)
 
 

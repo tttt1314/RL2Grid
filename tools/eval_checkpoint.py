@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import time
@@ -70,6 +71,43 @@ def _warmup_obs_rms(run_args, model, warmup_steps: int, warmup_split: str, seed:
         w_env.close()
 
 
+def compute_safe_metrics(survs: np.ndarray, raw_overloads: np.ndarray, max_steps: float) -> dict[str, float]:
+    """Compute survival, full-horizon compliance, tail-risk (p10/CVaR10), and raw violation-rate metrics."""
+    n = int(len(survs))
+    mean_s = float(np.mean(survs)) if n > 0 else 0.0
+    std_s = float(np.std(survs, ddof=1)) if n > 1 else 0.0
+    ci95 = 1.96 * std_s / math.sqrt(n) if n > 0 else 0.0
+    median_s = float(np.median(survs)) if n > 0 else 0.0
+    p10_s = float(np.percentile(survs, 10)) if n > 0 else 0.0
+    k10 = max(1, int(math.ceil(0.1 * n))) if n > 0 else 0
+    cvar10 = float(np.mean(np.sort(survs)[:k10])) if n > 0 else 0.0
+    full_rate = float(np.mean(survs >= 1.0 - 1e-6)) if n > 0 else 0.0
+    fail_rate = 1.0 - full_rate
+    mean_raw_cost = float(np.mean(raw_overloads)) if len(raw_overloads) > 0 else 0.0
+    max_raw_cost = float(np.max(raw_overloads)) if len(raw_overloads) > 0 else 0.0
+    total_steps = float(np.sum(survs * max_steps))
+    viol_per_1k = float(1000.0 * np.sum(raw_overloads) / max(1.0, total_steps))
+    min_s = float(np.min(survs)) if n > 0 else 0.0
+    max_s = float(np.max(survs)) if n > 0 else 0.0
+    return {
+        "n": n,
+        "mean_s": mean_s,
+        "std_s": std_s,
+        "ci95": ci95,
+        "median_s": median_s,
+        "p10_s": p10_s,
+        "cvar10": cvar10,
+        "full_rate": full_rate,
+        "fail_rate": fail_rate,
+        "mean_raw_cost": mean_raw_cost,
+        "max_raw_cost": max_raw_cost,
+        "total_steps": total_steps,
+        "viol_per_1k": viol_per_1k,
+        "min_s": min_s,
+        "max_s": max_s,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a saved RL2Grid checkpoint on any chronics split.")
     parser.add_argument("--ckpt", type=Path, required=True, help="Path to checkpoint .tar file")
@@ -80,6 +118,8 @@ def main() -> None:
                         help="Warmup steps to rebuild obs_rms if checkpoint lacks saved obs_rms")
     parser.add_argument("--warmup-split", type=str, default="train", choices=["all", "train", "val", "test"])
     parser.add_argument("--seed", type=int, default=2000)
+    parser.add_argument("--json-out", type=Path, default=None,
+                        help="Optional path to write full JSON evaluation metrics")
     cli = parser.parse_args()
 
     from env.eval import EvalPool
@@ -96,8 +136,13 @@ def main() -> None:
     eval_args.eval_workers = cli.eval_workers
     eval_args.chronics_split = cli.chronics_split
     eval_args.eval_chronics_split = cli.chronics_split
+    # Always measure raw overload + disconnection violations uniformly across all algorithms.
+    eval_args.constraints_type = 2
+    eval_args.fail_absorbing_cost = 0.0
+    eval_args.keep_disc_penalty = True
 
     sample_env, _ = auxiliary_make_env(eval_args, eval_env=True, idx=0)
+    max_steps = float(sample_env.init_env.chronics_handler.max_episode_duration())
     dummy_envs = argparse.Namespace(
         single_observation_space=sample_env.observation_space,
         single_action_space=sample_env.action_space,
@@ -118,26 +163,40 @@ def main() -> None:
 
     n_tags = 3 + (1 if run_args.action_type == "topology" else 0) + (1 if getattr(run_args, "n1_reward", False) else 0)
     n_workers = min(cli.eval_workers, cli.eval_episodes)
-    cmdp = getattr(run_args, "constraints_type", 0) != 0
 
     pool = EvalPool(eval_args, n_workers=n_workers, n_tags=n_tags, base_idx=cli.seed)
     try:
-        results = pool.run(model, obs_rms, cli.eval_episodes, cmdp=cmdp)
+        results = pool.run(model, obs_rms, cli.eval_episodes, cmdp=True)
     finally:
         pool.close()
 
     survs = np.array([r[0] for r in results], dtype=float)
-    costs = np.array([r[2] for r in results], dtype=float)
-    mean_s = float(np.mean(survs))
-    std_s = float(np.std(survs, ddof=1)) if len(survs) > 1 else 0.0
-    ci95 = 1.96 * std_s / math.sqrt(len(survs))
+    raw_overloads = np.array([r[2] for r in results], dtype=float)
+    metrics = compute_safe_metrics(survs, raw_overloads, max_steps)
     dt = time.time() - t0
-    cost_str = f" | mean_cost={costs.mean():.2f}" if cmdp else ""
     print(
         f"CKPT={cli.ckpt.name} | alg={alg} | split={cli.chronics_split} | obs_rms={rms_src} | "
-        f"n={len(survs)} | survival={mean_s:.4f} ± {ci95:.4f} (std={std_s:.4f}, min-max={survs.min():.3f}-{survs.max():.3f})"
-        f"{cost_str} | time={dt:.1f}s"
+        f"n={metrics['n']} | survival={metrics['mean_s']:.4f} ± {metrics['ci95']:.4f} "
+        f"(std={metrics['std_s']:.4f}, median={metrics['median_s']:.4f}, p10={metrics['p10_s']:.4f}, "
+        f"cvar10={metrics['cvar10']:.4f}, full_rate={metrics['full_rate']:.3f}) | "
+        f"raw_overload={metrics['mean_raw_cost']:.2f} (max={metrics['max_raw_cost']:.1f}) | "
+        f"viol_per_1k={metrics['viol_per_1k']:.3f} | time={dt:.1f}s"
     )
+
+    if cli.json_out is not None:
+        cli.json_out.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ckpt": str(cli.ckpt),
+            "alg": alg,
+            "split": cli.chronics_split,
+            "obs_rms_source": rms_src,
+            "seed": cli.seed,
+            "max_steps": max_steps,
+            "metrics": metrics,
+            "survs": survs.tolist(),
+            "raw_overloads": raw_overloads.tolist(),
+        }
+        cli.json_out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

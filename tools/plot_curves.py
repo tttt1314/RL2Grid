@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from pathlib import Path
 
@@ -548,10 +549,158 @@ def make_e6c_figure(jobs: dict[str, dict], out_path: Path) -> None:
     plt.close(fig)
 
 
+def make_stage2_figure(jobs: dict[str, dict], eval_dir: Path, out_path: Path) -> None:
+    """Plot 2x2 Stage-2 unseen-test Pareto front, train-vs-test gap, tail risk, and val curves."""
+    model_specs = [
+        ("S2_PPO_T_V_3M_s0", "Vanilla PPO (3M)", "0.35", "s", "--"),
+        ("S2_LAGRPPO_C1_ORIG_s0", "Orig LagrPPO C1", "tab:red", "v", "-"),
+        ("S2_E6C_C1_PID_AW_s0", "Ours: PID+AW C1", "tab:blue", "o", "-"),
+        ("S2_E6A_C2_O5FIX_s0", "Ours: Stabilized O5 C2", "tab:green", "D", "-"),
+    ]
+    test_m = {
+        jid: json.loads((eval_dir / f"{jid}_test100.json").read_text())["metrics"]
+        for jid, *_ in model_specs
+    }
+    train_m = {
+        jid: json.loads((eval_dir / f"{jid}_train50.json").read_text())["metrics"]
+        for jid, *_ in model_specs
+    }
+
+    idle_pt = None
+    bpath = eval_dir / "baselines_test.log"
+    if bpath.exists():
+        m_idle = re.search(
+            r"\[IDLE\] n=\d+ \| survival=([\d.]+) ± ([\d.]+).*?C2_cost=([\d.]+)",
+            bpath.read_text(errors="ignore"),
+        )
+        if m_idle:
+            sv_i, ci_i, c2_i = float(m_idle.group(1)), float(m_idle.group(2)), float(m_idle.group(3))
+            idle_pt = (1000.0 * c2_i / (sv_i * 8064.0), sv_i, ci_i)
+
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 9.2), dpi=180)
+    fig.suptitle(
+        "Stage 2 (Strict 70/15/15 Split, 3M): Unseen Test Pareto Front, Tail Risk & Generalization — bus14, seed 0",
+        fontsize=12.8,
+        fontweight="bold",
+        y=0.98,
+    )
+
+    # Panel A: Pareto Front on Unseen Test (n=100)
+    ax = axes[0, 0]
+    offsets = {
+        "S2_E6A_C2_O5FIX_s0": (22.0, 0.71),
+        "S2_PPO_T_V_3M_s0": (22.0, 0.43),
+        "S2_E6C_C1_PID_AW_s0": (26.0, 0.30),
+        "S2_LAGRPPO_C1_ORIG_s0": (550.0, 0.57),
+    }
+    for jid, name, color, marker, _ls in model_specs:
+        mt = test_m[jid]
+        x, y, ye = mt["viol_per_1k"], mt["mean_s"], mt["ci95"]
+        ax.errorbar(
+            x, y, yerr=ye, fmt=marker, color=color, markersize=8.5, capsize=4, elinewidth=1.6,
+            zorder=4, label=f"{name}: surv={y:.3f}, viol={x:.1f}/1k",
+        )
+        tx, ty = offsets[jid]
+        ax.annotate(
+            f"{name}\n({y:.3f}, {x:.1f}/1k)",
+            xy=(x, y), xytext=(tx, ty),
+            arrowprops=dict(arrowstyle="->", color=color, lw=1.0),
+            fontsize=7.6, fontweight="bold" if "O5 C2" in name else "normal", color=color,
+        )
+    if idle_pt is not None:
+        ix, iy, ie = idle_pt
+        ax.errorbar(ix, iy, yerr=ie, fmt="X", color="tab:gray", markersize=8.5, capsize=4, elinewidth=1.5, zorder=3)
+        ax.annotate(
+            f"Idle ({iy:.3f}, {ix:.1f}/1k)",
+            xy=(ix, iy), xytext=(28.0, 0.14),
+            arrowprops=dict(arrowstyle="->", color="tab:gray", lw=1.0),
+            fontsize=7.6, color="0.35",
+        )
+    ax.set_xscale("log")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.3)
+    ax.set_xlim(5.0, 3200.0)
+    ax.set_ylim(0.05, 0.84)
+    ax.set_xticks([6, 10, 20, 50, 150, 500, 1600])
+    ax.get_xaxis().set_major_formatter(FuncFormatter(lambda v, _: f"{int(v)}"))
+    ax.annotate(
+        "Pareto Better &\nSafer (top-left)",
+        xy=(6.0, 0.78), xytext=(12.0, 0.77),
+        arrowprops=dict(arrowstyle="->", color="tab:green", lw=1.4),
+        fontsize=8.0, fontweight="bold", color="tab:green",
+    )
+    ax.set_title("A. Safety-Performance Pareto Front (Unseen Test, n=100)")
+    ax.set_xlabel("Raw Overload + Disconnection Violations / 1k Steps (log scale)")
+    ax.set_ylabel("Unseen Test Survival (mean ± 95% CI)")
+
+    # Panel B: Train (n=50) vs Unseen Test (n=100) Generalization Gap
+    ax = axes[0, 1]
+    xs = np.arange(len(model_specs))
+    w = 0.34
+    tr_means = [train_m[jid]["mean_s"] for jid, *_ in model_specs]
+    tr_cis = [train_m[jid]["ci95"] for jid, *_ in model_specs]
+    te_means = [test_m[jid]["mean_s"] for jid, *_ in model_specs]
+    te_cis = [test_m[jid]["ci95"] for jid, *_ in model_specs]
+    ax.bar(xs - w / 2, tr_means, w, yerr=tr_cis, capsize=3.5, color="#4C78A8", alpha=0.88, label="Train Split (n=50)")
+    ax.bar(xs + w / 2, te_means, w, yerr=te_cis, capsize=3.5, color="#F58518", alpha=0.88, label="Unseen Test Split (n=100)")
+    for i, (trv, trc, tev, tec) in enumerate(zip(tr_means, tr_cis, te_means, te_cis)):
+        top = max(trv + trc, tev + tec) + 0.025
+        ax.text(i, top, f"gap={trv - tev:+.3f}", ha="center", va="bottom", fontsize=7.6, fontweight="bold")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.3)
+    ax.set_xticks(xs)
+    ax.set_xticklabels(["Vanilla\nPPO (3M)", "Orig\nLagrPPO C1", "Ours:\nPID+AW C1", "Ours:\nStab O5 C2"], fontsize=8.5)
+    ax.set_ylim(0.0, 0.90)
+    ax.set_title("B. Train vs. Unseen Test Generalization Gap")
+    ax.set_ylabel("Mean Survival (± 95% CI)")
+    ax.legend(loc="upper left", fontsize=8.0, frameon=True, framealpha=0.92)
+
+    # Panel C: Unseen Test Reliability & Tail Risk (Mean, CVaR10, Full-Month Rate)
+    ax = axes[1, 0]
+    w3 = 0.25
+    means = [test_m[jid]["mean_s"] for jid, *_ in model_specs]
+    cvars = [test_m[jid]["cvar10"] for jid, *_ in model_specs]
+    fulls = [test_m[jid]["full_rate"] for jid, *_ in model_specs]
+    b1 = ax.bar(xs - w3, means, w3, color="#4C78A8", label="Mean Survival")
+    b2 = ax.bar(xs, cvars, w3, color="#E45756", label="CVaR10 (Worst 10% Mean)")
+    b3 = ax.bar(xs + w3, fulls, w3, color="#54A24B", label="Full-Month Rate (surv=1.0)")
+    for bars in (b1, b2, b3):
+        for bar in bars:
+            h = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width() / 2, h + 0.012, f"{h:.2f}", ha="center", va="bottom", fontsize=6.9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.3)
+    ax.set_xticks(xs)
+    ax.set_xticklabels(["Vanilla\nPPO (3M)", "Orig\nLagrPPO C1", "Ours:\nPID+AW C1", "Ours:\nStab O5 C2"], fontsize=8.5)
+    ax.set_ylim(0.0, 0.76)
+    ax.set_title("C. Unseen Test Reliability & Tail Risk (n=100)")
+    ax.set_ylabel("Proportion / Survival Score")
+    ax.legend(loc="upper left", fontsize=7.8, frameon=True, framealpha=0.92)
+
+    # Panel D: Validation Split Learning Curves (0-3M, 150 val chronics)
+    ax = axes[1, 1]
+    for jid, name, color, _marker, ls in model_specs:
+        l3, bst, _ = _eval_summary(jobs[jid])
+        plot_eval_series(ax, jobs[jid], f"{name} (val last3={l3:.3f}, best={bst:.3f})", color, ls, linewidth=2.0)
+    style_axes(ax, max_step=3_000_000, ylim=(-0.02, 0.90))
+    ax.set_title("D. Validation Split Learning Curves (150 Val Chronics, 3-eval MA)")
+    ax.set_xlabel("Environment Steps (trained on 702 train chronics)")
+    ax.set_ylabel("Val Survival (10 eps, 3-eval MA)")
+    ax.legend(loc="upper left", fontsize=7.5, frameon=True, framealpha=0.92)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.955])
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--logs-dir", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--eval-dir", type=Path, default=None)
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -565,6 +714,10 @@ def main() -> None:
     e6c_keys = {"E6C_C1_PID_AW_s0", "E6C_C2_PID_ABS005_s0", "E6C_C2_PID_ABS010_s0", "E1_C1_LAM0_KEEPDISC_s0"}
     if e6c_keys.issubset(jobs):
         make_e6c_figure(jobs, args.out_dir / "e6c_stage1_comparison.png")
+    eval_dir = args.eval_dir if args.eval_dir is not None else (args.logs_dir.parent / "stage2_eval")
+    s2_keys = {"S2_PPO_T_V_3M_s0", "S2_LAGRPPO_C1_ORIG_s0", "S2_E6C_C1_PID_AW_s0", "S2_E6A_C2_O5FIX_s0"}
+    if s2_keys.issubset(jobs) and eval_dir.is_dir() and all((eval_dir / f"{k}_test100.json").exists() for k in s2_keys):
+        make_stage2_figure(jobs, eval_dir, args.out_dir / "stage2_pareto_generalization.png")
     print("Generated figures in", args.out_dir)
 
 
